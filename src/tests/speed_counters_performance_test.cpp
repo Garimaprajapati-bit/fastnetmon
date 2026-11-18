@@ -2,6 +2,13 @@
 #include <iostream>
 #include <thread>
 #include <unordered_map>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <random>
+#include <string>
+#include <vector>
 
 #include <boost/archive/binary_iarchive.hpp>
 
@@ -253,79 +260,179 @@ template <typename T> void do_parallel_memory_copy(const T& counter_map) {
     }
 }
 
-int main() {
-    std::cout << "Load structure from disk dump" << std::endl;
+// Unconditional check (unlike assert(), which is compiled out under -DNDEBUG / Release builds,
+// which would silently disable every validity check below). Records failures so the process can
+// exit non-zero.
+static int g_check_failures = 0;
+static void check(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << "  [CHECK FAILED] " << message << std::endl;
+        g_check_failures++;
+    }
+}
 
-    time_t start_time = 0;
-    time(&start_time);
+// Current resident set size of this process in MB (actual, measured), or -1 if unavailable.
+static long current_rss_mb() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            long kb = 0;
+            if (std::sscanf(line.c_str(), "VmRSS: %ld kB", &kb) == 1) return kb / 1024;
+        }
+    }
+    return -1;
+}
 
-    try {
-        std::ifstream deserialize_stream("/home/odintsov/speed_counters_local_ipv4_hosts.dat");
-        boost::archive::binary_iarchive input_archive(deserialize_stream);
+int main(int argc, char** argv) {
+    // Source selection:
+    //   argv[1] = path to a real production dump (optional). If absent or unreadable we
+    //             generate a synthetic, deliberately MULTI-SHARD source, so the all-shards
+    //             iteration below is genuinely exercised (shard 0 does NOT hold everything).
+    //   argv[2] = synthetic source shard count (default 8)
+    //   argv[3] = synthetic host count        (default 2000000)
+    //   argv[4] = timing iterations           (default 3; the original used an infinite loop)
+    const char* dump_path     = (argc > 1 && argv[1][0] != '\0') ? argv[1] : nullptr;
+    size_t synth_src_shards   = (argc > 2) ? (size_t)std::strtoul(argv[2], nullptr, 10) : 8;
+    long   synth_hosts        = (argc > 3) ? std::strtol(argv[3], nullptr, 10) : 2000000;
+    int    iterations         = (argc > 4) ? std::atoi(argv[4]) : 3;
+    if (synth_src_shards == 0) synth_src_shards = 1;
+    if (iterations < 1) iterations = 1;
 
-        input_archive >> BOOST_SERIALIZATION_NVP(ipv4_host_counters);
-        std::cout << "Loaded traffic counters from disk" << std::endl;
-    } catch (boost::archive::archive_exception& e) {
-        std::cout << "Internal error with loading traffic counters from disk: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cout << "Internal error with loading traffic counters from disk" << std::endl;
-        ;
-        return 1;
+    bool loaded = false;
+    if (dump_path) {
+        std::cout << "Load structure from disk dump: " << dump_path << std::endl;
+        time_t start_time = 0;
+        time(&start_time);
+        try {
+            std::ifstream deserialize_stream(dump_path);
+            boost::archive::binary_iarchive input_archive(deserialize_stream);
+
+            input_archive >> BOOST_SERIALIZATION_NVP(ipv4_host_counters);
+            loaded = true;
+
+            time_t finish_time = 0;
+            time(&finish_time);
+            std::cout << "Loaded traffic counters from disk in " << finish_time - start_time << " seconds"
+                      << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "Could not load dump (" << e.what() << "); falling back to synthetic data" << std::endl;
+        } catch (...) {
+            std::cout << "Could not load dump; falling back to synthetic data" << std::endl;
+        }
     }
 
-    time_t finish_time = 0;
-    time(&finish_time);
+    if (!loaded) {
+        std::cout << "Generating synthetic MULTI-SHARD source: " << synth_hosts << " hosts across "
+                  << synth_src_shards << " source shards" << std::endl;
+        // Make the SOURCE span multiple internal shards, so shards[0] is NOT the whole set.
+        ipv4_host_counters.configure_sharding(synth_src_shards, 1);
+        simple_packet_t current_packet;
+        current_packet.protocol = 6;
+        std::mt19937 rng(123456789u);
+        for (long i = 0; i < synth_hosts; i++) {
+            uint32_t ip           = rng(); // diverse keys spread over both source shards and partitions
+            current_packet.length = 40 + (ip % 1400);
+            ipv4_host_counters.increment_incoming_counters_for_key(ip, current_packet, 1 + (ip % 5),
+                                                                   current_packet.length);
+        }
+    }
 
-    std::cout << "Loaded traffic from disk in " << finish_time - start_time << " seconds" << std::endl;
+    // ---- Source statistics across EVERY shard (not just shard 0) ------------
+    size_t src_total = 0, src_buckets = 0, populated_src_shards = 0;
+    for (auto& s : ipv4_host_counters.shards) {
+        std::lock_guard<std::mutex> g(s->mutex);
+        src_total += s->counter_map.size();
+        src_buckets += s->counter_map.bucket_count();
+        if (!s->counter_map.empty()) populated_src_shards++;
+    }
 
-    std::cout << "Map size " << ipv4_host_counters.shards[0]->counter_map.size() << std::endl;
-    std::cout << "Map bucket count " << ipv4_host_counters.shards[0]->counter_map.bucket_count() << std::endl;
-
-    std::cout << "Memory use by single counter map: "
-              << ipv4_host_counters.shards[0]->counter_map.size() * (sizeof(subnet_counter_t) + sizeof(uint32_t)) / 1024 / 1024
-              << " Mb" << std::endl;
-
-    /*
-    try_to_copy_to_vector(ipv4_host_counters.counter_map);
-
-    try_to_copy_to_vector_initilised_elements(ipv4_host_counters.counter_map);
-
-    try_to_copy_to_std_unordered_map(ipv4_host_counters.counter_map, false);
-
-    try_to_copy_to_std_unordered_map(ipv4_host_counters.counter_map, true);
-
-    try_to_copy_to_std_unordered_map_pre_created_keys(ipv4_host_counters.counter_map);
-
-    // Well, key findings that it does not scale as we expected ;(
-    do_parallel_memory_copy(ipv4_host_counters.counter_map);
-
-    // This test cannot free up memory, we should run it as last
-    try_to_copy_to_array(ipv4_host_counters.counter_map);
-    */
+    std::cout << "Source container shards: " << ipv4_host_counters.shards.size()
+              << " (populated: " << populated_src_shards << ")" << std::endl;
+    std::cout << "Total hosts across all source shards: " << src_total << std::endl;
+    std::cout << "Total bucket count across all source shards: " << src_buckets << std::endl;
+    std::cout << "Estimated counter-map memory (lower bound: keys+values only, excludes bucket/allocator "
+                 "overhead): "
+              << (src_total * (sizeof(subnet_counter_t) + sizeof(uint32_t))) / 1024 / 1024 << " Mb" << std::endl;
+    long rss = current_rss_mb();
+    if (rss >= 0) {
+        std::cout << "Actual process RSS (measured): " << rss << " Mb" << std::endl;
+    } else {
+        std::cout << "Actual process RSS (measured): unavailable on this platform" << std::endl;
+    }
 
     double speed_calc_period        = 1;
     double average_calculation_time = 60;
 
-    std::cout << "Loaded" << std::endl;
-
-    std::cout << "Sharding data" << std::endl;
-
+    // ---- Redistribute hosts into 32 independent partition-containers --------
+    // Ownership model: partition index = fast_ntoh(ip) % 32 selects which of the 32 INDEPENDENT
+    // counter containers owns a host; each container is swept by its own thread below (this is the
+    // benchmark's 32-way sharding experiment). We iterate EVERY source shard and insert through the
+    // public, invariant-respecting API (modify_counter_for_key routes the key via shard_for()),
+    // instead of poking .shards[0] directly.
+    std::cout << "Sharding data into 32 partitions" << std::endl;
     const int sharding_value = 32;
 
     std::array<abstract_subnet_counters_t<uint32_t, subnet_counter_t>, sharding_value> speed_counters;
 
-    for (const auto& itr : ipv4_host_counters.shards[0]->counter_map) {
-        // NB!!!! TODO: without ntoh conversion it will be 2 all the time and sharding will not work!!!
-        int reminder = fast_ntoh(itr.first) % sharding_value;
-
-        // std::cout << "value" << itr.first << "reminder: " << reminder << std::endl;
-        speed_counters[reminder].shards[0]->counter_map[itr.first] = itr.second;
+    size_t redistributed = 0;
+    for (auto& s : ipv4_host_counters.shards) {
+        std::lock_guard<std::mutex> g(s->mutex);
+        for (const auto& itr : s->counter_map) {
+            // NB! ntoh is required: raw big-endian keys would collapse onto a handful of partitions.
+            int reminder = fast_ntoh(itr.first) % sharding_value;
+            speed_counters[reminder].modify_counter_for_key(
+                itr.first, [&itr](subnet_counter_t& dst) { dst = itr.second; });
+            redistributed++;
+        }
     }
 
-    for (const auto& current_speed_counter : speed_counters) {
-        std::cout << "Speed counter size: " << current_speed_counter.shards[0]->counter_map.size() << std::endl;
+    // ---- Validity assertions (redistribution must be a faithful partition) --
+    size_t dst_total            = 0;
+    int    populated_partitions = 0;
+    for (auto& sc : speed_counters) {
+        size_t sz = sc.size();
+        dst_total += sz;
+        if (sz > 0) populated_partitions++;
     }
+
+    // Placement correctness: every key in partition p must map back to p, and the union of all
+    // partitions must equal the source key set (so nothing was dropped or silently duplicated).
+    size_t placement_errors = 0, union_count = 0;
+    for (int p = 0; p < sharding_value; p++) {
+        for (auto& s : speed_counters[p].shards) {
+            std::lock_guard<std::mutex> g(s->mutex);
+            for (const auto& itr : s->counter_map) {
+                if ((int)(fast_ntoh(itr.first) % sharding_value) != p) placement_errors++;
+                union_count++;
+            }
+        }
+    }
+
+    std::cout << "\nRedistribution check:" << std::endl;
+    std::cout << "  source entries          : " << src_total << std::endl;
+    std::cout << "  entries iterated/placed : " << redistributed << std::endl;
+    std::cout << "  destination entries     : " << dst_total << std::endl;
+    std::cout << "  union over partitions   : " << union_count << std::endl;
+    std::cout << "  misplaced entries       : " << placement_errors << std::endl;
+    std::cout << "  populated partitions    : " << populated_partitions << "/" << sharding_value << std::endl;
+    for (int i = 0; i < sharding_value; i++) {
+        std::cout << "    partition[" << i << "] size: " << speed_counters[i].size() << std::endl;
+    }
+
+    check(redistributed == src_total, "every source host must be visited exactly once");
+    check(dst_total == src_total, "no host dropped or duplicated during redistribution");
+    check(union_count == src_total, "union of partitions must equal the source key set");
+    check(placement_errors == 0, "every host must sit in the partition its key maps to");
+    if (src_total >= 1000) {
+        check(populated_partitions == sharding_value,
+              "a representative dataset should populate all 32 partitions");
+    }
+    if (g_check_failures != 0) {
+        std::cerr << "REDISTRIBUTION VALIDATION FAILED (" << g_check_failures << " check(s))" << std::endl;
+        return 1;
+    }
+    std::cout << "All redistribution checks passed." << std::endl;
 
     /*
      Lab server has: AMD Ryzen 5 3600 6-Core Processor
@@ -414,16 +521,25 @@ int main() {
 
      */
 
-    while (true) {
+    std::cout << "\nRunning " << iterations << " parallel speed-calc iteration(s) over " << sharding_value
+              << " partitions" << std::endl;
+
+    for (int iter = 0; iter < iterations; iter++) {
         timeval start_time_val;
         gettimeofday(&start_time_val, NULL);
 
         std::vector<std::thread> threads;
+        threads.reserve(sharding_value);
 
         for (auto& current_speed_counter : speed_counters) {
-            threads.push_back(std::thread([&]() {
-                current_speed_counter.recalculate_speed(speed_calc_period, average_calculation_time, nullptr);
-            }));
+            // Capture a POINTER to THIS specific array element, by value. The previous code
+            // captured the range-for variable by reference ([&]); since that variable is recreated
+            // each iteration, every thread ended up aliasing the same (last) element -- some
+            // partitions were swept repeatedly, others never, and the reference outlived its scope.
+            abstract_subnet_counters_t<uint32_t, subnet_counter_t>* counter_ptr = &current_speed_counter;
+            threads.emplace_back([counter_ptr, speed_calc_period, average_calculation_time]() {
+                counter_ptr->recalculate_speed(speed_calc_period, average_calculation_time, nullptr);
+            });
         }
 
         // Wait threads to finish
