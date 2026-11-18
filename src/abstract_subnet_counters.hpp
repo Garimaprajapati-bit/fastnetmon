@@ -262,21 +262,45 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
             std::atomic<size_t> next_shard{ 0 };
             std::exception_ptr first_error;
             std::mutex error_mutex;
+
+            // Each worker (and the current thread, in the fallback below) runs this: pull
+            // shards off next_shard until none remain. Any worker count >= 1 drains every
+            // shard, so losing some workers only costs parallelism, never coverage.
+            auto worker_body = [&]() {
+                size_t i;
+                while ((i = next_shard.fetch_add(1)) < num_shards) {
+                    try {
+                        process_shard(*shards[i]);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> error_guard(error_mutex);
+                        if (!first_error) first_error = std::current_exception();
+                    }
+                }
+            };
+
             std::vector<std::thread> workers;
             workers.reserve(nt);
-            for (size_t t = 0; t < nt; t++) {
-                workers.emplace_back([&]() {
-                    size_t i;
-                    while ((i = next_shard.fetch_add(1)) < num_shards) {
-                        try {
-                            process_shard(*shards[i]);
-                        } catch (...) {
-                            std::lock_guard<std::mutex> error_guard(error_mutex);
-                            if (!first_error) first_error = std::current_exception();
-                        }
-                    }
-                });
+
+            // Creating a thread can fail under resource exhaustion (pthread_create EAGAIN
+            // on RLIMIT_NPROC / stack memory), which throws std::system_error from the
+            // std::thread constructor. If that propagated here, the workers vector would be
+            // destroyed with still-joinable threads and call std::terminate() — turning a
+            // transient shortage into a daemon crash. Instead we stop spawning and keep the
+            // workers we already have; if none were created we sweep inline. Correctness is
+            // preserved either way (every shard is still processed exactly once).
+            try {
+                for (size_t t = 0; t < nt; t++) {
+                    workers.emplace_back(worker_body);
+                }
+            } catch (const std::system_error&) {
+                // Degrade gracefully to however many workers we managed to start.
             }
+
+            if (workers.empty()) {
+                // Not a single worker could be started: do the whole sweep on this thread.
+                worker_body();
+            }
+
             for (auto& w : workers) w.join();
             if (first_error) std::rethrow_exception(first_error);
         }
