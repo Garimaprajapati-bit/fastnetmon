@@ -279,11 +279,11 @@ int main() {
 
     std::cout << "Loaded traffic from disk in " << finish_time - start_time << " seconds" << std::endl;
 
-    std::cout << "Map size " << ipv4_host_counters.counter_map.size() << std::endl;
-    std::cout << "Map bucket count " << ipv4_host_counters.counter_map.bucket_count() << std::endl;
+    std::cout << "Map size " << ipv4_host_counters.shards[0]->counter_map.size() << std::endl;
+    std::cout << "Map bucket count " << ipv4_host_counters.shards[0]->counter_map.bucket_count() << std::endl;
 
     std::cout << "Memory use by single counter map: "
-              << ipv4_host_counters.counter_map.size() * (sizeof(subnet_counter_t) + sizeof(uint32_t)) / 1024 / 1024
+              << ipv4_host_counters.shards[0]->counter_map.size() * (sizeof(subnet_counter_t) + sizeof(uint32_t)) / 1024 / 1024
               << " Mb" << std::endl;
 
     /*
@@ -315,16 +315,16 @@ int main() {
 
     std::array<abstract_subnet_counters_t<uint32_t, subnet_counter_t>, sharding_value> speed_counters;
 
-    for (const auto& itr : ipv4_host_counters.counter_map) {
+    for (const auto& itr : ipv4_host_counters.shards[0]->counter_map) {
         // NB!!!! TODO: without ntoh conversion it will be 2 all the time and sharding will not work!!!
         int reminder = fast_ntoh(itr.first) % sharding_value;
 
         // std::cout << "value" << itr.first << "reminder: " << reminder << std::endl;
-        speed_counters[reminder].counter_map[itr.first] = itr.second;
+        speed_counters[reminder].shards[0]->counter_map[itr.first] = itr.second;
     }
 
     for (const auto& current_speed_counter : speed_counters) {
-        std::cout << "Speed counter size: " << current_speed_counter.counter_map.size() << std::endl;
+        std::cout << "Speed counter size: " << current_speed_counter.shards[0]->counter_map.size() << std::endl;
     }
 
     /*
