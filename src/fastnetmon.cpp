@@ -684,6 +684,39 @@ bool load_configuration_file() {
         recalculate_speed_timeout = convert_string_to_integer(configuration_map["speed_calculation_delay"]);
     }
 
+    // Optional parallel speed calculation. Defaults keep the original single-threaded,
+    // single-shard behaviour exactly; operators opt in explicitly. Applied here at
+    // config load, before the per-host counters are populated or touched by any thread.
+    {
+        unsigned int speed_calculation_threads = 1;
+        unsigned int speed_calculation_shards  = 0; // 0 = auto-derive from thread count
+
+        if (configuration_map.count("speed_calculation_threads") != 0) {
+            speed_calculation_threads = convert_string_to_integer(configuration_map["speed_calculation_threads"]);
+        }
+
+        if (configuration_map.count("speed_calculation_shards") != 0) {
+            speed_calculation_shards = convert_string_to_integer(configuration_map["speed_calculation_shards"]);
+        }
+
+        if (speed_calculation_threads < 1) {
+            speed_calculation_threads = 1;
+        }
+
+        if (speed_calculation_shards == 0) {
+            // Give the sweep enough shards to spread across the worker threads.
+            speed_calculation_shards = (speed_calculation_threads > 1) ? speed_calculation_threads * 16 : 1;
+        }
+
+        ipv4_host_counters.configure_sharding(speed_calculation_shards, speed_calculation_threads);
+        ipv6_host_counters.configure_sharding(speed_calculation_shards, speed_calculation_threads);
+
+        if (speed_calculation_threads > 1) {
+            logger << log4cpp::Priority::INFO << "Parallel speed calculation enabled: "
+                   << speed_calculation_threads << " threads over " << speed_calculation_shards << " shards";
+        }
+    }
+
     if (configuration_map.count("monitor_local_ip_addresses") != 0) {
         monitor_local_ip_addresses = configuration_map["monitor_local_ip_addresses"] == "on" ? true : false;
     }
@@ -1250,15 +1283,14 @@ void subnet_vectors_allocator(prefix_t* prefix, void* data) {
 
         // We use big endian values as keys
         try {
-            ipv4_host_counters.average_speed_map[result_ip_as_big_endian] = zero_map_element;
-            ipv4_host_counters.counter_map[result_ip_as_big_endian] = zero_map_element;
+            ipv4_host_counters.preallocate_key(result_ip_as_big_endian, zero_map_element);
         } catch (std::bad_alloc& ba) {
             logger << log4cpp::Priority::ERROR << "Can't allocate memory for hash counters";
             exit(1);
         }
     }
 
-    logger << log4cpp::Priority::INFO << "Successfully allocated " << ipv4_host_counters.average_speed_map.size() << " counters";
+    logger << log4cpp::Priority::INFO << "Successfully allocated " << ipv4_host_counters.average_speed_size() << " counters";
 }
 
 // Load flow spec based whitelist

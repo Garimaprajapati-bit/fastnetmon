@@ -1,5 +1,6 @@
 #include "fastnetmon_logic.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -1951,13 +1952,15 @@ void recalculate_speed() {
         speed_calc_period = time_difference;
     }
 
-    uint64_t incoming_total_flows = 0;
-    uint64_t outgoing_total_flows = 0;
+    // Atomic: the recalc sweep may fold flow counts concurrently across shards.
+    // Single-threaded behaviour is identical; the summed totals are order-independent.
+    std::atomic<uint64_t> incoming_total_flows{ 0 };
+    std::atomic<uint64_t> outgoing_total_flows{ 0 };
 
     ipv4_network_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
 
-    uint64_t flow_exists_for_ip         = 0;
-    uint64_t flow_does_not_exist_for_ip = 0;
+    std::atomic<uint64_t> flow_exists_for_ip{ 0 };
+    std::atomic<uint64_t> flow_does_not_exist_for_ip{ 0 };
 
     ipv4_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv4, [&outgoing_total_flows, &incoming_total_flows, &flow_exists_for_ip,
      &flow_does_not_exist_for_ip](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
@@ -2307,20 +2310,16 @@ void process_ipv6_packet(simple_packet_t& current_packet) {
     __sync_fetch_and_add(&total_ipv6_packets, 1);
 #endif
 
-    {
-        std::lock_guard<std::mutex> lock_guard(ipv6_network_counters.counter_map_mutex);
-
-        // We will create keys for new subnet here on demand
-        subnet_counter_t* counter_ptr = &ipv6_network_counters.counter_map[ipv6_cidr_subnet];
-
+    // We will create keys for new subnet here on demand (locks only this key's shard)
+    ipv6_network_counters.modify_counter_for_key(ipv6_cidr_subnet, [&](subnet_counter_t& counters) {
         if (current_packet.packet_direction == OUTGOING) {
-            counter_ptr->total.out_packets += sampled_number_of_packets;
-            counter_ptr->total.out_bytes += sampled_number_of_bytes;
+            counters.total.out_packets += sampled_number_of_packets;
+            counters.total.out_bytes += sampled_number_of_bytes;
         } else if (current_packet.packet_direction == INCOMING) {
-            counter_ptr->total.in_packets += sampled_number_of_packets;
-            counter_ptr->total.in_bytes += sampled_number_of_bytes;
+            counters.total.in_packets += sampled_number_of_packets;
+            counters.total.in_bytes += sampled_number_of_bytes;
         }
-    }
+    });
 
     // Here I use counters allocated per /128. In some future we could offer option to count them in diffenrent way
     // (/64, /96)
@@ -2454,16 +2453,14 @@ void process_packet(simple_packet_t& current_packet) {
     }
 
     if (current_packet.packet_direction == OUTGOING or current_packet.packet_direction == INCOMING) {
-        std::lock_guard<std::mutex> lock_guard(ipv4_network_counters.counter_map_mutex);
-
-        // We will create keys for new subnet here on demand
-        subnet_counter_t& counters = ipv4_network_counters.counter_map[current_subnet];
-
-        if (current_packet.packet_direction == OUTGOING) {
-            increment_outgoing_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-        } else if (current_packet.packet_direction == INCOMING) {
-            increment_incoming_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-        }
+        // We will create keys for new subnet here on demand (locks only this key's shard)
+        ipv4_network_counters.modify_counter_for_key(current_subnet, [&](subnet_counter_t& counters) {
+            if (current_packet.packet_direction == OUTGOING) {
+                increment_outgoing_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+            } else if (current_packet.packet_direction == INCOMING) {
+                increment_incoming_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+            }
+        });
     }
 
     /* Because we support mirroring, sflow and netflow we should support different cases:
@@ -3067,10 +3064,7 @@ void send_usage_data_to_reporting_server() {
 
         ssize_t hosts_hash_size_ipv6 = 0;
 
-        {
-            std::lock_guard<std::mutex> lock_guard(ipv6_host_counters.counter_map_mutex);
-            hosts_hash_size_ipv6 = ipv6_host_counters.average_speed_map.size();
-        }
+        hosts_hash_size_ipv6 = ipv6_host_counters.average_speed_size();
 
         stats["hosts_hash_ipv6"] = hosts_hash_size_ipv6;
 
