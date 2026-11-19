@@ -50,7 +50,7 @@ def main():
     span = min(args.hosts, net.num_addresses)
     rng = random.Random(args.seed)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.connect((args.host, args.port))        # connect() lets us use send() (faster)
+    dest = (args.host, args.port)               # connectionless: don't die if collector blips
 
     pkts_per_sec = max(1, args.rate // MAXFLOWS)
     interval = 1.0 / pkts_per_sec
@@ -95,7 +95,10 @@ def main():
             seq += len(flows)
             hdr = HDR.pack(5, len(flows), int((now - uptime0) * 1000) & 0xFFFFFFFF,
                            int(now), 0, seq, 0, 0, 1)
-            sock.send(hdr + b"".join(flows))
+            try:
+                sock.sendto(hdr + b"".join(flows), dest)
+            except OSError:
+                pass   # fire-and-forget: a transient "no listener" must not kill the run
             sent_flows += len(flows)
 
             # pace to target rate

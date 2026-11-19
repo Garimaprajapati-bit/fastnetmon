@@ -16,7 +16,11 @@ CONF=/etc/fastnetmon.conf
 NETWORKS=/etc/networks_list
 LOG=/var/log/fastnetmon.log
 BIN="${FNM_BIN:-/opt/fastnetmon-community/app/bin/fastnetmon}"
-SUBNET="${SUBNET:-10.0.0.0/8}"
+NFPORT="${NFPORT:-2055}"
+# NB: the daemon PRE-ALLOCATES one counter per IP in this network at startup, so the host
+# count == subnet size and RAM scales with it: /12 = 1M hosts (~1.5 GB), /10 = 4M (~5 GB),
+# /9 = 8.4M (~11 GB), /8 = 16.7M (~21 GB). Default /12 for smoke/load; override SUBNET for soak.
+SUBNET="${SUBNET:-10.0.0.0/12}"
 GEN="$(dirname "$0")/netflow_gen.py"
 MON="$(dirname "$0")/monitor.sh"
 
@@ -48,9 +52,18 @@ set_threads() { sed -i '/speed_calculation_threads/d;/speed_calculation_shards/d
   echo "speed_calculation_threads=${1:-16}"; }
 
 start() { set_threads "${1:-16}"; : > "$LOG"
-  "$BIN" --configuration_check || { echo "CONFIG INVALID"; exit 1; }
+  "$BIN" --configuration_check >/dev/null 2>&1 || { echo "CONFIG INVALID:"; "$BIN" --configuration_check 2>&1 | tail -15; exit 1; }
   nohup "$BIN" >> "$LOG" 2>&1 &  echo $! > /tmp/fnm.pid
-  sleep 5; if kill -0 "$(cat /tmp/fnm.pid)" 2>/dev/null; then echo "daemon up pid=$(cat /tmp/fnm.pid), log=$LOG"; else echo "DAEMON FAILED TO START — tail $LOG"; tail -20 "$LOG"; fi; }
+  local pid; pid=$(cat /tmp/fnm.pid)
+  echo "daemon pid=$pid; waiting for NetFlow collector on :$NFPORT (it pre-allocates hosts first)..."
+  for i in $(seq 1 180); do
+    kill -0 "$pid" 2>/dev/null || { echo "DAEMON DIED during startup — tail $LOG:"; tail -30 "$LOG"; return 1; }
+    if ss -lun 2>/dev/null | grep -qE "[:.]$NFPORT\b"; then
+      echo "collector listening on :$NFPORT after ${i}s (pid=$pid, RSS=$(awk '/VmRSS/{print int($2/1024)}' /proc/$pid/status) MB)"; return 0
+    fi
+    sleep 1
+  done
+  echo "collector NOT listening on :$NFPORT after 180s — tail $LOG:"; tail -30 "$LOG"; return 1; }
 
 stop() { [ -f /tmp/fnm.pid ] && kill "$(cat /tmp/fnm.pid)" 2>/dev/null; pkill -x fastnetmon 2>/dev/null; echo "stopped"; }
 
