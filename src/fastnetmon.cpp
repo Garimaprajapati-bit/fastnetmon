@@ -413,8 +413,8 @@ abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_co
 // Host counters for IPv4
 abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
 
-// Flow tracking structures
-map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+// Flow tracking structures (sharded: per-shard locks instead of one global flow_counter_mutex)
+sharded_flow_counters_t SubnetVectorMapFlow;
 
 std::string netflow_ipfix_all_protocols_total_flows_speed_desc = "Number of IPFIX and Netflow per second";
 int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
@@ -422,7 +422,7 @@ int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
 std::string sflow_raw_packet_headers_total_speed_desc = "Number of sFlow headers per second";
 int64_t sflow_raw_packet_headers_total_speed          = 0;
 
-std::mutex flow_counter_mutex;
+// flow_counter_mutex removed: SubnetVectorMapFlow is now sharded with per-shard locks.
 
 #ifdef GEOIP
 map_for_counters GeoIpCounter;
@@ -1274,7 +1274,7 @@ void subnet_vectors_allocator(prefix_t* prefix, void* data) {
             // On creating it initializes by zeros
             conntrack_main_struct_t zero_conntrack_main_struct{};
 
-            SubnetVectorMapFlow[ip_as_little_endian] = zero_conntrack_main_struct;
+            SubnetVectorMapFlow.preallocate(ip_as_little_endian, zero_conntrack_main_struct);
         }
 
         uint32_t result_ip_as_big_endian = fast_hton(ip_as_little_endian);

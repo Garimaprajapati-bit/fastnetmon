@@ -10,7 +10,10 @@
 #include <stdint.h> // uint32_t
 #include <sys/time.h> // struct timeval
 
+#include <functional> // std::hash
 #include <map>
+#include <memory> // std::unique_ptr
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility> // std::pair
@@ -494,6 +497,65 @@ typedef std::map<subnet_cidr_mask_t, vector_of_counters> map_of_vector_counters_
 
 // Flow tracking structures
 typedef std::map<uint32_t, conntrack_main_struct_t> map_of_vector_counters_for_flow_t;
+
+// Sharded flow-tracking counters.
+//
+// Splits the single global flow map + single global mutex into N independent {map, mutex}
+// shards keyed by hash(ip). The once-per-second parallel speed sweep reads one host's flows at
+// a time and the packet-path writers add flows continuously; with a single global lock they all
+// serialise on it (and the parallel sweep workers contend for it). Here a key is routed to
+// exactly one shard, so each access locks only that shard. Per-key semantics are identical to
+// the single-map version: a host's flows always live in one shard and are read exactly when that
+// host is processed; only the lock is partitioned. Flow counting and ban_for_flows are unchanged.
+class sharded_flow_counters_t {
+    public:
+    struct shard_t {
+        std::map<uint32_t, conntrack_main_struct_t> map;
+        std::mutex mutex;
+    };
+
+    size_t num_shards;
+    std::vector<std::unique_ptr<shard_t>> shards;
+
+    explicit sharded_flow_counters_t(size_t shard_count = 256) : num_shards(shard_count == 0 ? 1 : shard_count) {
+        shards.reserve(num_shards);
+        for (size_t i = 0; i < num_shards; i++) shards.push_back(std::make_unique<shard_t>());
+    }
+
+    inline shard_t& shard_for(uint32_t key) {
+        return *shards[std::hash<uint32_t>{}(key) % num_shards];
+    }
+
+    // Lock the key's shard and hand the (auto-created) entry to fn — for writers / create-on-demand.
+    template <typename F> void with_entry(uint32_t key, F&& fn) {
+        shard_t& s = shard_for(key);
+        std::lock_guard<std::mutex> lock_guard(s.mutex);
+        fn(s.map[key]);
+    }
+
+    // Lock the key's shard and hand a pointer (null if absent) to fn; returns fn's result — for readers.
+    template <typename F> auto read_entry(uint32_t key, F&& fn) {
+        shard_t& s = shard_for(key);
+        std::lock_guard<std::mutex> lock_guard(s.mutex);
+        auto itr = s.map.find(key);
+        return fn(itr == s.map.end() ? nullptr : &itr->second);
+    }
+
+    // Create/overwrite a zeroed entry (startup pre-allocation).
+    void preallocate(uint32_t key, const conntrack_main_struct_t& zero_value) {
+        shard_t& s = shard_for(key);
+        std::lock_guard<std::mutex> lock_guard(s.mutex);
+        s.map[key] = zero_value;
+    }
+
+    // Clear every shard (end-of-sweep reset).
+    void clear() {
+        for (auto& s : shards) {
+            std::lock_guard<std::mutex> lock_guard(s->mutex);
+            s->map.clear();
+        }
+    }
+};
 
 typedef subnet_counter_t subnet_counter_t;
 typedef std::pair<subnet_cidr_mask_t, subnet_counter_t> pair_of_map_for_subnet_counters_elements_t;
