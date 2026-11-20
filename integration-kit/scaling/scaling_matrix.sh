@@ -51,7 +51,7 @@ hosts_in_cidrs(){ local t=0 c p; for c in $1; do p="${c##*/}"; t=$((t+(1<<(32-p)
 read_udp(){ awk '/^Udp:/{if(h==""){for(i=2;i<=NF;i++)k[i]=$i;h=1}else{for(i=2;i<=NF;i++)v[k[i]]=$i}}
                  END{printf "%s %s %s", v["InDatagrams"]+0, v["InErrors"]+0, v["RcvbufErrors"]+0}' /proc/net/snmp; }
 read_swap(){ awk '/^pswpin/{i=$2}/^pswpout/{o=$2}END{printf "%s %s", i+0, o+0}' /proc/vmstat; }
-oom_count(){ dmesg 2>/dev/null | grep -ciE 'out of memory|oom-kill|killed process' || echo 0; }
+oom_count(){ local n; n=$(dmesg 2>/dev/null | grep -ciE 'out of memory|oom-kill|killed process'); echo "${n:-0}"; }
 prom_metric(){ curl -s --max-time 3 "$PROM_URL" 2>/dev/null | awk -v m="$1" '$1==m{print $2; exit}'; }
 mem_line(){ awk '/^MemAvailable/{ma=$2}/^SwapTotal/{st=$2}/^SwapFree/{sf=$2}
                  END{printf "%d %d", int(ma/1024), int((st-sf)/1024)}' /proc/meminfo; }
