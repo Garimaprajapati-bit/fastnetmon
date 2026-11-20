@@ -153,12 +153,27 @@ tracking live), and how repeatable it is.
 **Stage 2 — validate at ~10M.** Only once Stage 1 is stable, same 1 / 2 / 4 / 8 × 3 matrix at ~10M
 monitored hosts (the harness uses `10.0.0.0/9 + 10.128.0.0/11` = 10,485,760, and RAM-guards the row).
 
+Monitored vs active hosts are reported separately (they are different things): the **monitored** count
+(networks_list CIDR size) drives the recalc sweep cost; the **active** count (generator) drives
+flow-tracking load. For 1M they are equal (1,048,576 — use that, not 1,000,000). For ~10M the generator
+spans one /9 (8,388,608 active) while 10,485,760 are monitored; this is labelled, not hidden.
+
 Metrics recorded per run (both stages): recalc **min / median / p95 / max**, **over-budget count**,
-**peak RSS**, **avg/peak CPU**, **UDP InErrors + RcvbufErrors deltas** (→ received ≈ sent when both 0,
-i.e. no silent collector loss), **sent flows**, and **detections** (correctness / behaviour unchanged).
+**peak RSS**, **avg/peak CPU**, and for input integrity the authoritative **parsed_flows** (daemon
+Prometheus `fastnetmon_netflow_ipfix_all_protocols_total_flows` delta) vs **sent_flows** →
+**flow_loss = sent − parsed** (0 ⇒ every generated flow was parsed), plus **recv_packets**, **UDP
+InErrors/RcvbufErrors** and **swap in/out + OOM-kill** deltas as context. (Kernel UDP errors = 0 is *not*
+proof of zero loss — `flow_loss` from the parsed counter is the real check.) Workload is deterministic
+(generator seed fixed at 1), so thread-count comparisons are genuinely like-for-like. A per-row RAM
+preflight refuses to start a workload that won't fit or when the box is already swapping.
+
+**Correctness scope here is narrow:** the matrix runs with 0 attackers, so `detections` must be 0 in
+every run (no false positives). Equal detection *counts* do not prove identical detection *behaviour*;
+proving detection equivalence across thread counts needs a **separate** run with a fixed attacker set,
+comparing the banned-IP sets / notify events — TODO, not part of this scaling matrix.
 
 **The key result we want:** at ~10M, does 8-thread recalc time improve over 1/2/4 threads, *without*
-increasing packet loss or changing detection? That is far stronger than the standalone micro-benchmark,
+`flow_loss` rising or `detections` changing? That is far stronger than the standalone micro-benchmark,
 which does not model reporting, flow tracking, allocation, or packet ingestion.
 
 **Honest caveat to carry:** the earlier ~3.75×/~4.1× figures were standalone; the integrated daemon may
