@@ -1875,14 +1875,13 @@ void speed_calculation_callback_local_ipv4(const uint32_t& client_ip, const subn
 // Increments in and out flow counters
 // Returns false when we cannot find flow for this IP
 bool increment_flow_counters(subnet_counter_t& new_speed_element, uint32_t client_ip, double speed_calc_period) {
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
-    extern std::mutex flow_counter_mutex;
+    extern map_of_vector_counters_for_flow_t flow_snapshot_for_sweep;
 
-    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+    // Lock-free read: during the sweep this snapshot is read-only (it was swapped out of the live
+    // map under lock before the sweep began; packet-path writers only touch the live map now).
+    auto current_flow_counter = flow_snapshot_for_sweep.find(client_ip);
 
-    auto current_flow_counter = SubnetVectorMapFlow.find(client_ip);
-
-    if (current_flow_counter == SubnetVectorMapFlow.end()) {
+    if (current_flow_counter == flow_snapshot_for_sweep.end()) {
         // We have no entries for this IP
         return false;
     }
@@ -1962,10 +1961,25 @@ void recalculate_speed() {
     std::atomic<uint64_t> flow_exists_for_ip{ 0 };
     std::atomic<uint64_t> flow_does_not_exist_for_ip{ 0 };
 
+    // Freeze this second's flow map so the parallel per-host reads below are LOCK-FREE. Swapping is
+    // O(1) and leaves the live map empty for the next second's packet-path writers.
+    if (enable_connection_tracking) {
+        extern map_of_vector_counters_for_flow_t flow_snapshot_for_sweep;
+        extern std::mutex flow_counter_mutex;
+        std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+        std::swap(SubnetVectorMapFlow, flow_snapshot_for_sweep);
+    }
+
+    // ===== TEMP PROFILING (diagnostic branch only) =====
+    std::atomic<uint64_t> prof_flow_read_ns{ 0 };
+    auto prof_t0 = std::chrono::steady_clock::now();
+
     ipv4_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv4, [&outgoing_total_flows, &incoming_total_flows, &flow_exists_for_ip,
-     &flow_does_not_exist_for_ip](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
+     &flow_does_not_exist_for_ip, &prof_flow_read_ns](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
         if (enable_connection_tracking) {
+            auto prof_fr0 = std::chrono::steady_clock::now();
             bool res = increment_flow_counters(new_speed_element, fast_ntoh(ip), speed_calc_period);
+            prof_flow_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_fr0).count();
 
             if (res) {
                 // Increment global counter
@@ -1973,30 +1987,39 @@ void recalculate_speed() {
                 incoming_total_flows += new_speed_element.in_flows;
 
                 flow_exists_for_ip++;
-
-                // logger << log4cpp::Priority::DEBUG << convert_ipv4_subnet_to_string(subnet)
-                //    << "in flows: " << new_speed_element.in_flows << " out flows: " <<
-                //    new_speed_element.out_flows;
             } else {
                 // We did not find record
                 flow_does_not_exist_for_ip++;
             }
         }
     });
+    auto prof_t1 = std::chrono::steady_clock::now();
 
     // Calculate IPv6 per network traffic
     ipv6_network_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
 
     // Recalculate traffic for hosts
     ipv6_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv6);
+    auto prof_t2 = std::chrono::steady_clock::now();
 
     if (enable_connection_tracking) {
         // Calculate global flow speed
         incoming_total_flows_speed = uint64_t((double)incoming_total_flows / (double)speed_calc_period);
         outgoing_total_flows_speed = uint64_t((double)outgoing_total_flows / (double)speed_calc_period);
 
-        zeroify_all_flow_counters();
+        // Discard this sweep's snapshot (lock-free: only this thread touches it now). Replaces the
+        // old zeroify_all_flow_counters() — the swap already emptied the live map.
+        extern map_of_vector_counters_for_flow_t flow_snapshot_for_sweep;
+        flow_snapshot_for_sweep.clear();
     }
+    auto prof_t3 = std::chrono::steady_clock::now();
+    logger << log4cpp::Priority::ERROR << "PROFILE ms: ipv4_host_sweep_wall="
+           << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t1 - prof_t0).count()
+           << " flow_read_cpu=" << (prof_flow_read_ns.load() / 1000000)
+           << " ipv6_host_sweep_wall=" << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t2 - prof_t1).count()
+           << " snapshot_clear=" << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t3 - prof_t2).count()
+           << " hosts_with_flows=" << flow_exists_for_ip.load();
+    // ===== END TEMP PROFILING =====
 
     total_unparsed_packets_speed = uint64_t((double)total_unparsed_packets / (double)speed_calc_period);
     total_unparsed_packets       = 0;

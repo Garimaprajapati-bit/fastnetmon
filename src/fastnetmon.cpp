@@ -416,6 +416,12 @@ abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
 // Flow tracking structures
 map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
 
+// Per-sweep snapshot of the flow map. Once per second recalculate_speed swaps the live map into
+// this under flow_counter_mutex (an O(1) pointer swap); the parallel per-host sweep then reads
+// this snapshot WITHOUT any lock, while packet-path writers keep filling the now-empty live map.
+// This removes the per-host global lock that otherwise serialised the parallel sweep.
+map_of_vector_counters_for_flow_t flow_snapshot_for_sweep;
+
 std::string netflow_ipfix_all_protocols_total_flows_speed_desc = "Number of IPFIX and Netflow per second";
 int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
 
