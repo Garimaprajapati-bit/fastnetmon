@@ -1,0 +1,26 @@
+Avoid O(hosts) allocation in sharded get_top_k_average_speed
+
+The sharded top-k reporting path copied every host entry across all
+shards into a temporary vector once per second (for the console/log
+top-talkers table), reallocating ~1M entries on each call and holding
+every shard mutex for the duration of the copy. Under 1M monitored
+hosts with flow tracking and reporting enabled this produced a
+per-second page-fault burst and lock contention with the parallel
+speed-calculation sweep, occasionally pushing recalculate_speed over
+its 1-second budget.
+
+Compute each shard's top-k under its own lock into a reused k-sized
+buffer, then merge those per-shard results (at most shards*k entries)
+and take the final top-k. The global top-k of the union equals the
+top-k of the concatenation of the per-shard top-k results, so the
+output is unchanged. Allocation drops from O(hosts) to O(shards*k),
+and each shard lock is now held only for its own partial_sort_copy
+with no allocation under the lock.
+
+This reporting path feeds only the top-talkers display; attack/ban
+detection uses a separate callback and is unaffected.
+
+Measured at 1M hosts / 200k flows/s / 8 threads (tracking and
+reporting enabled): over-budget recalculations 2 -> 0, peak RSS
+1489 MB -> 1097 MB, detection output unchanged. Top-k equivalence
+verified over 20000 randomized trials, ASan/UBSan clean.
