@@ -1962,10 +1962,16 @@ void recalculate_speed() {
     std::atomic<uint64_t> flow_exists_for_ip{ 0 };
     std::atomic<uint64_t> flow_does_not_exist_for_ip{ 0 };
 
+    // ===== TEMP PROFILING (diagnostic branch only) =====
+    std::atomic<uint64_t> prof_flow_read_ns{ 0 };
+    auto prof_t0 = std::chrono::steady_clock::now();
+
     ipv4_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv4, [&outgoing_total_flows, &incoming_total_flows, &flow_exists_for_ip,
-     &flow_does_not_exist_for_ip](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
+     &flow_does_not_exist_for_ip, &prof_flow_read_ns](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
         if (enable_connection_tracking) {
+            auto prof_fr0 = std::chrono::steady_clock::now();
             bool res = increment_flow_counters(new_speed_element, fast_ntoh(ip), speed_calc_period);
+            prof_flow_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_fr0).count();
 
             if (res) {
                 // Increment global counter
@@ -1973,22 +1979,20 @@ void recalculate_speed() {
                 incoming_total_flows += new_speed_element.in_flows;
 
                 flow_exists_for_ip++;
-
-                // logger << log4cpp::Priority::DEBUG << convert_ipv4_subnet_to_string(subnet)
-                //    << "in flows: " << new_speed_element.in_flows << " out flows: " <<
-                //    new_speed_element.out_flows;
             } else {
                 // We did not find record
                 flow_does_not_exist_for_ip++;
             }
         }
     });
+    auto prof_t1 = std::chrono::steady_clock::now();
 
     // Calculate IPv6 per network traffic
     ipv6_network_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
 
     // Recalculate traffic for hosts
     ipv6_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv6);
+    auto prof_t2 = std::chrono::steady_clock::now();
 
     if (enable_connection_tracking) {
         // Calculate global flow speed
@@ -1997,6 +2001,14 @@ void recalculate_speed() {
 
         zeroify_all_flow_counters();
     }
+    auto prof_t3 = std::chrono::steady_clock::now();
+    logger << log4cpp::Priority::ERROR << "PROFILE ms: ipv4_host_sweep_wall="
+           << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t1 - prof_t0).count()
+           << " flow_read_cpu=" << (prof_flow_read_ns.load() / 1000000)
+           << " ipv6_host_sweep_wall=" << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t2 - prof_t1).count()
+           << " zeroify=" << std::chrono::duration_cast<std::chrono::milliseconds>(prof_t3 - prof_t2).count()
+           << " hosts_with_flows=" << flow_exists_for_ip.load();
+    // ===== END TEMP PROFILING =====
 
     total_unparsed_packets_speed = uint64_t((double)total_unparsed_packets / (double)speed_calc_period);
     total_unparsed_packets       = 0;
