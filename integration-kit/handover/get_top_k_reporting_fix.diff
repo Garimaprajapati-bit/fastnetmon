@@ -1,0 +1,41 @@
+diff --git a/src/abstract_subnet_counters.hpp b/src/abstract_subnet_counters.hpp
+index 4f5e67f..4a14ccf 100644
+--- a/src/abstract_subnet_counters.hpp
++++ b/src/abstract_subnet_counters.hpp
+@@ -339,12 +339,33 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
+     void get_top_k_average_speed(std::vector<std::pair<T, Counter>>& vector_for_sort,
+                                  const attack_detection_threshold_type_t& sorter_type,
+                                  const attack_detection_direction_type_t& sort_direction) {
++        const TrafficComparatorClass<std::pair<T, Counter>> comparator(sort_direction, sorter_type);
++        const size_t k = vector_for_sort.size();
++
++        // Per-shard top-k buffer, reused across shards. Bounded by k (the number of rows the
++        // caller wants, ~max_ips_in_list), never by the number of hosts, so this reporting path
++        // does no O(hosts) allocation. Each shard lock is held only for its own partial_sort_copy.
++        std::vector<std::pair<T, Counter>> shard_top(k);
++
++        // Pool of the per-shard top-k results: at most shards * k entries (tiny).
+         std::vector<std::pair<T, Counter>> merged;
++        merged.reserve(shards.size() * k);
++
+         for (auto& s : shards) {
+-            std::lock_guard<std::mutex> lock_guard(s->mutex);
+-            std::copy(s->average_speed_map.begin(), s->average_speed_map.end(), std::back_inserter(merged));
++            typename std::vector<std::pair<T, Counter>>::iterator shard_top_end;
++            {
++                std::lock_guard<std::mutex> lock_guard(s->mutex);
++                shard_top_end = std::partial_sort_copy(s->average_speed_map.begin(), s->average_speed_map.end(),
++                                                       shard_top.begin(), shard_top.end(), comparator);
++            }
++            // Only the [begin, shard_top_end) range was written this iteration; a shard with fewer
++            // than k hosts leaves the tail untouched, so copy exactly what was produced.
++            merged.insert(merged.end(), shard_top.begin(), shard_top_end);
+         }
++
++        // Global top-k over the union equals the top-k over the concatenation of per-shard top-k:
++        // any globally top-k element is top-k within its own shard, so none are lost here.
+         std::partial_sort_copy(merged.begin(), merged.end(), vector_for_sort.begin(), vector_for_sort.end(),
+-                               TrafficComparatorClass<std::pair<T, Counter>>(sort_direction, sorter_type));
++                               comparator);
+     }
+ };

@@ -1,0 +1,56 @@
+Generating synthetic MULTI-SHARD source: 2000000 hosts across 8 source shards
+Source container shards: 8 (populated: 8)
+Total hosts across all source shards: 1999597
+Total bucket count across all source shards: 2808488
+Estimated counter-map memory (lower bound: keys+values only, excludes bucket/allocator overhead): 480 Mb
+Actual process RSS (measured): 546 Mb
+Sharding data into 32 partitions
+
+Redistribution check:
+  source entries          : 1999597
+  entries iterated/placed : 1999597
+  destination entries     : 1999597
+  union over partitions   : 1999597
+  misplaced entries       : 0
+  populated partitions    : 32/32
+    partition[0] size: 62940
+    partition[1] size: 62177
+    partition[2] size: 62473
+    partition[3] size: 62709
+    partition[4] size: 62210
+    partition[5] size: 61976
+    partition[6] size: 62387
+    partition[7] size: 62941
+    partition[8] size: 62583
+    partition[9] size: 62586
+    partition[10] size: 62208
+    partition[11] size: 62782
+    partition[12] size: 62383
+    partition[13] size: 62405
+    partition[14] size: 62655
+    partition[15] size: 62357
+    partition[16] size: 63000
+    partition[17] size: 62346
+    partition[18] size: 62327
+    partition[19] size: 62748
+    partition[20] size: 62480
+    partition[21] size: 62313
+    partition[22] size: 62361
+    partition[23] size: 62369
+    partition[24] size: 62002
+    partition[25] size: 63106
+    partition[26] size: 62648
+    partition[27] size: 62772
+    partition[28] size: 62212
+    partition[29] size: 62318
+    partition[30] size: 62074
+    partition[31] size: 62749
+All redistribution checks passed.
+
+Running 3 parallel speed-calc iteration(s) over 32 partitions
+Calculated speed in 0.966266 seconds
+
+Calculated speed in 0.484743 seconds
+
+Calculated speed in 0.482238 seconds
+

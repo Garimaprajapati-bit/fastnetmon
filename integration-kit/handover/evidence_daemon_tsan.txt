@@ -1,0 +1,10 @@
+=== Daemon ThreadSanitizer: feature ON (threads=4) vs OFF (threads=1), identical load ===
+feature ON  warnings: 35
+feature OFF warnings: 37
+race sites ONLY-with-feature-ON (introduced by parallelization): 0
+race sites in sweep machinery (hpp:229-307): 0
+
+--- example pre-existing race site: fastnetmon_logic.cpp:2005/2008 (global total_counters, lock-free, recalc-thread vs packet-threads) ---
+--- example pre-existing race: gRPC Epoll1Poller / RunApiServer (API server, upstream) ---
+
+Conclusion: parallel sweep introduces ZERO new data races; flagged races are pre-existing daemon races (lock-free global aggregates + gRPC), present with the feature OFF.
