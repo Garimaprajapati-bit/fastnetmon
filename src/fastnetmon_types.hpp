@@ -495,6 +495,25 @@ typedef std::map<subnet_cidr_mask_t, vector_of_counters> map_of_vector_counters_
 // Flow tracking structures
 typedef std::map<uint32_t, conntrack_main_struct_t> map_of_vector_counters_for_flow_t;
 
+// Sharded connection-tracking store. The flow map was a single std::map guarded by one global
+// mutex, locked once per host by the per-second speed sweep (and by every packet-path flow update).
+// With the speed sweep parallelised that single lock serialises all workers. Sharding the map +
+// mutex by a mixed hash of the (host-order) client IP lets different hosts use different locks, so
+// the parallel sweep's flow reads and the packet threads' flow writes rarely contend. Semantics are
+// unchanged: each IP still maps to exactly one map, consistently for readers and writers.
+#include <mutex>
+#include <cstdint>
+static const size_t FLOW_COUNTER_SHARD_COUNT = 256; // power of two
+struct sharded_flow_counters_t {
+    map_of_vector_counters_for_flow_t maps[FLOW_COUNTER_SHARD_COUNT];
+    std::mutex mutexes[FLOW_COUNTER_SHARD_COUNT];
+    static inline size_t shard_of(uint32_t client_ip) {
+        uint64_t h = client_ip;
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+        return (size_t)(h & (FLOW_COUNTER_SHARD_COUNT - 1));
+    }
+};
+
 typedef subnet_counter_t subnet_counter_t;
 typedef std::pair<subnet_cidr_mask_t, subnet_counter_t> pair_of_map_for_subnet_counters_elements_t;
 typedef std::map<subnet_cidr_mask_t, subnet_counter_t> map_for_subnet_counters_t;

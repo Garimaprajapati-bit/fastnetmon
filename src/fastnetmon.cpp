@@ -413,8 +413,8 @@ abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_co
 // Host counters for IPv4
 abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
 
-// Flow tracking structures
-map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+// Flow tracking structures (sharded map + per-shard mutex; see sharded_flow_counters_t)
+sharded_flow_counters_t SubnetVectorMapFlow;
 
 std::string netflow_ipfix_all_protocols_total_flows_speed_desc = "Number of IPFIX and Netflow per second";
 int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
@@ -422,7 +422,6 @@ int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
 std::string sflow_raw_packet_headers_total_speed_desc = "Number of sFlow headers per second";
 int64_t sflow_raw_packet_headers_total_speed          = 0;
 
-std::mutex flow_counter_mutex;
 
 #ifdef GEOIP
 map_for_counters GeoIpCounter;
@@ -1274,7 +1273,8 @@ void subnet_vectors_allocator(prefix_t* prefix, void* data) {
             // On creating it initializes by zeros
             conntrack_main_struct_t zero_conntrack_main_struct{};
 
-            SubnetVectorMapFlow[ip_as_little_endian] = zero_conntrack_main_struct;
+            size_t flow_shard = sharded_flow_counters_t::shard_of(ip_as_little_endian);
+            SubnetVectorMapFlow.maps[flow_shard][ip_as_little_endian] = zero_conntrack_main_struct;
         }
 
         uint32_t result_ip_as_big_endian = fast_hton(ip_as_little_endian);
@@ -2146,6 +2146,52 @@ int main(int argc, char** argv) {
         service_thread_group.add_thread(new boost::thread(clickhouse_push_thread));
     }
 #endif
+
+    // Benchmark-only: pre-populate host counters through the REAL ingest path so the integrated
+    // recalc sweep can be measured at scale without depending on the UDP collector. Env-gated;
+    // zero cost in normal operation. FNM_BENCH_PREPOP=<host count>.
+    if (const char* prepop_env = getenv("FNM_BENCH_PREPOP")) {
+        extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+        uint64_t prepop_n = strtoull(prepop_env, nullptr, 10);
+        logger << log4cpp::Priority::INFO << "FNM_BENCH_PREPOP: populating " << prepop_n
+               << " synthetic hosts via the real ingest path";
+        simple_packet_t bench_pkt;
+        bench_pkt.protocol = 6;
+        // Distinct IPs inside 10.0.0.0/8 (16.7M addrs >= any realistic prepop count), so a single
+        // 10.0.0.0/8 entry in networks_list matches every host (real ban-settings path, no WARN).
+        // host-order key uses network byte order to match how the daemon stores IPv4 keys.
+        for (uint64_t i = 0; i < prepop_n; i++) {
+            uint32_t host_order = 0x0A000000u | (uint32_t)(i & 0x00FFFFFFu);
+            uint32_t ip         = htonl(host_order);
+            bench_pkt.length = 40 + (host_order % 1400);
+            ipv4_host_counters.increment_incoming_counters_for_key(ip, bench_pkt, 1 + (host_order % 5), bench_pkt.length);
+        }
+        logger << log4cpp::Priority::INFO << "FNM_BENCH_PREPOP: done, host_counters size=" << ipv4_host_counters.size();
+    }
+
+    // Benchmark-only: dump the REAL per-shard host distribution so the hash-mixing fix can be verified
+    // on production keys (not just aggregate counts). Env-gated. FNM_BENCH_SHARD_DIST=1.
+    if (getenv("FNM_BENCH_SHARD_DIST")) {
+        extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+        size_t ns = ipv4_host_counters.shards.size();
+        size_t total = 0, mn = SIZE_MAX, mx = 0, empty = 0;
+        for (auto& s : ipv4_host_counters.shards) {
+            std::lock_guard<std::mutex> g(s->mutex);
+            size_t c = s->keys.size();
+            total += c; if (c < mn) mn = c; if (c > mx) mx = c; if (c == 0) empty++;
+        }
+        double mean = ns ? (double)total / (double)ns : 0.0;
+        double var = 0.0;
+        for (auto& s : ipv4_host_counters.shards) {
+            std::lock_guard<std::mutex> g(s->mutex);
+            double d = (double)s->keys.size() - mean; var += d * d;
+        }
+        double stddev = ns ? std::sqrt(var / (double)ns) : 0.0;
+        logger << log4cpp::Priority::INFO << "FNM_BENCH_SHARD_DIST shards=" << ns << " total_hosts=" << total
+               << " min=" << mn << " max=" << mx << " mean=" << mean << " stddev=" << stddev
+               << " cv=" << (mean > 0 ? stddev / mean : 0.0) << " empty_shards=" << empty
+               << " imbalance_max_over_mean=" << (mean > 0 ? (double)mx / mean : 0.0);
+    }
 
     // start thread for recalculating speed in realtime
     service_thread_group.add_thread(new boost::thread(recalculate_speed_thread_handler));

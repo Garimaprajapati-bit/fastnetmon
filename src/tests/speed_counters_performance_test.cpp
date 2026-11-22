@@ -342,9 +342,9 @@ int main(int argc, char** argv) {
     size_t src_total = 0, src_buckets = 0, populated_src_shards = 0;
     for (auto& s : ipv4_host_counters.shards) {
         std::lock_guard<std::mutex> g(s->mutex);
-        src_total += s->counter_map.size();
-        src_buckets += s->counter_map.bucket_count();
-        if (!s->counter_map.empty()) populated_src_shards++;
+        src_total += s->keys.size();
+        src_buckets += s->counters.capacity();
+        if (!s->keys.empty()) populated_src_shards++;
     }
 
     std::cout << "Source container shards: " << ipv4_host_counters.shards.size()
@@ -378,11 +378,13 @@ int main(int argc, char** argv) {
     size_t redistributed = 0;
     for (auto& s : ipv4_host_counters.shards) {
         std::lock_guard<std::mutex> g(s->mutex);
-        for (const auto& itr : s->counter_map) {
+        for (size_t j = 0; j < s->keys.size(); j++) {
+            const uint32_t key = s->keys[j];
+            const subnet_counter_t& val = s->counters[j];
             // NB! ntoh is required: raw big-endian keys would collapse onto a handful of partitions.
-            int reminder = fast_ntoh(itr.first) % sharding_value;
+            int reminder = fast_ntoh(key) % sharding_value;
             speed_counters[reminder].modify_counter_for_key(
-                itr.first, [&itr](subnet_counter_t& dst) { dst = itr.second; });
+                key, [&val](subnet_counter_t& dst) { dst = val; });
             redistributed++;
         }
     }
@@ -402,8 +404,8 @@ int main(int argc, char** argv) {
     for (int p = 0; p < sharding_value; p++) {
         for (auto& s : speed_counters[p].shards) {
             std::lock_guard<std::mutex> g(s->mutex);
-            for (const auto& itr : s->counter_map) {
-                if ((int)(fast_ntoh(itr.first) % sharding_value) != p) placement_errors++;
+            for (size_t j = 0; j < s->keys.size(); j++) {
+                if ((int)(fast_ntoh(s->keys[j]) % sharding_value) != p) placement_errors++;
                 union_count++;
             }
         }

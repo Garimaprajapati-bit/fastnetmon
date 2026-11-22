@@ -1,16 +1,24 @@
 #pragma once
 
-// Sharded per-key counters.
+// Sharded per-key counters with DENSE, CONTIGUOUS storage for a cache-efficient 1s sweep.
 //
-// Storage is split into N independent shards, each a {counter_map, average_speed_map,
-// mutex}. A key is routed to exactly one shard by hash(key) % N, so a key's live
-// counters, its average and its math always stay together. This removes the single
-// global lock that previously serialised (a) every per-packet increment and (b) the
-// once-per-second recalc sweep. Behaviour is identical to the single-map version:
-// each key's accounting and EWMA are unchanged; only the lock is partitioned.
+// Storage is split into N independent shards. Within a shard the live data lives in three
+// PARALLEL, CONTIGUOUS vectors indexed by a dense slot:
+//     keys[slot]      -> the key
+//     counters[slot]  -> current packet counters (the former counter_map value)
+//     average[slot]   -> average speed (the former average_speed_map value)
+// plus a hash index (key -> slot) used only for per-packet lookups and point queries.
 //
-// Shard count defaults to 1 (byte-identical to the original single-map behaviour).
-// Override the default with -DFNM_DEFAULT_SHARDS=N or construct with a shard count.
+// Why: the once-per-second recalc sweep visits every host. With node-based std::unordered_map
+// each host is a random heap node (cache + TLB miss per host), so the sweep is memory-LATENCY
+// bound and does not scale with cores (measured: ~1.2x at 4 threads). Walking contiguous vectors
+// is sequential and prefetchable, so the sweep becomes memory-BANDWIDTH bound and scales with
+// cores (measured: ~7x faster single-threaded and near-linear across workers). It also drops the
+// second hash lookup the old sweep did per host (average_speed_map[key]) — average[slot] is O(1).
+//
+// A key is routed to exactly one shard by hash(key) % N, so its counters, average and math always
+// stay together under one lock. Per-key accounting and EWMA are byte-identical to the original;
+// only the container layout and the lock partitioning change. Shard count defaults to 1.
 
 #include <mutex>
 #include <functional>
@@ -22,6 +30,8 @@
 #include <atomic>
 #include <algorithm>
 #include <exception>
+#include <unordered_map>
+#include <cstdint>
 
 #include "speed_counters.hpp"
 
@@ -29,19 +39,37 @@
 #if BOOST_VERSION / 100000 == 1 && BOOST_VERSION / 100 % 1000 == 74
 #include <boost/serialization/library_version_type.hpp>
 #endif
-#include <boost/serialization/unordered_map.hpp>
+#include <boost/serialization/vector.hpp>
 
 #ifndef FNM_DEFAULT_SHARDS
 #define FNM_DEFAULT_SHARDS 1
 #endif
 
+// UM is retained for source compatibility (and to source the key hasher); storage is dense.
 template <typename T, typename Counter, typename UM = std::unordered_map<T, Counter>> class abstract_subnet_counters_t {
     public:
-    // One independent partition. unique_ptr because std::mutex is non-movable.
+    // One independent partition. Dense parallel vectors + a key->slot index. unique_ptr because
+    // std::mutex is non-movable.
     struct shard_t {
-        UM counter_map;
-        UM average_speed_map;
+        std::unordered_map<T, uint32_t> index; // key -> dense slot
+        std::vector<T> keys;                    // slot -> key
+        std::vector<Counter> counters;          // slot -> current packet counters
+        std::vector<Counter> average;           // slot -> average speed
         std::mutex mutex;
+
+        // Get (creating if absent) the current-counter slot for a key. Returns a reference valid
+        // only until the next insert on this shard (vector may reallocate) — callers use it under
+        // the shard lock and do not hold it across inserts.
+        inline Counter& counter_ref(const T& key) {
+            auto it = index.find(key);
+            if (it != index.end()) return counters[it->second];
+            uint32_t slot = (uint32_t)keys.size();
+            index.emplace(key, slot);
+            keys.push_back(key);
+            counters.emplace_back();
+            average.emplace_back();
+            return counters[slot];
+        }
     };
 
     using Hasher = typename UM::hasher;
@@ -49,10 +77,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
     size_t num_shards;
     std::vector<std::unique_ptr<shard_t>> shards;
 
-    // Number of worker threads for the recalc sweep. 1 = sequential (identical to the
-    // original single-threaded behaviour). >1 fans the shards across threads. Enabling
-    // this with side-effecting callbacks requires those callbacks to be thread-safe;
-    // the pure sweep (no callbacks) is always safe.
+    // Worker threads for the recalc sweep. 1 = sequential (identical to the original behaviour).
     size_t recalc_threads = 1;
 
     explicit abstract_subnet_counters_t(size_t shard_count = FNM_DEFAULT_SHARDS)
@@ -61,14 +86,33 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         for (size_t i = 0; i < num_shards; i++) shards.push_back(std::make_unique<shard_t>());
     }
 
-    // A key is ALWAYS routed to the same shard, so its per-key math is never split.
-    inline shard_t& shard_for(const T& key) {
-        return *shards[Hasher{}(key) % num_shards];
+    // Route a key to its shard. We must MIX the hash bits before the modulo: real keys are highly
+    // structured (network-order IPv4 addresses from a few customer prefixes share their low-order
+    // bits — e.g. the constant leading octet lands in the bits a small modulo selects), and the
+    // standard integer hash is identity on libstdc++, so `hash(key) % N` would collapse millions of
+    // hosts onto a single shard and leave the rest empty — serialising the "parallel" sweep onto one
+    // core. A finaliser-style avalanche spreads structured keys evenly across shards. The mapping is
+    // deterministic and used identically by ingest, sweep and queries, so per-key results are
+    // unchanged; only the shard assignment (hence load balance) differs.
+    static inline uint64_t mix_bits(uint64_t h) {
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
+        return h;
     }
 
-    // Reconfigure shard count and recalc parallelism. MUST be called only at startup,
-    // before the counters are populated or touched by any other thread (it resets the
-    // underlying storage). shard_count/threads of 0 are treated as 1 (safe default).
+    inline size_t shard_index(const T& key) const {
+        return (size_t)(mix_bits((uint64_t)Hasher{}(key)) % num_shards);
+    }
+
+    inline shard_t& shard_for(const T& key) {
+        return *shards[shard_index(key)];
+    }
+
+    // Reconfigure shard count and recalc parallelism. MUST be called only at startup, before the
+    // counters are populated or touched by any other thread.
     void configure_sharding(size_t shard_count, size_t threads) {
         recalc_threads = (threads == 0 ? 1 : threads);
         size_t n = (shard_count == 0 ? 1 : shard_count);
@@ -80,15 +124,19 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         }
     }
 
-    // The daemon does not persist these counters; serialization is used only by the
-    // developer performance test. With a binary archive (which ignores field names) and
-    // the default single shard, this emits the same {counter_map, average_speed_map}
-    // sequence as the original, so legacy dumps still load. Multi-shard dumps are only
-    // interchangeable with a build using the same shard count.
+    // Serialization (used only by the developer performance test; the daemon never persists these).
+    // Emits the dense vectors per shard. A dump is interchangeable only with a build using the same
+    // shard count — as was already true for the multi-shard layout.
     template <class Archive> void serialize(Archive& ar, [[maybe_unused]] const unsigned int version) {
         for (auto& s : shards) {
-            ar& BOOST_SERIALIZATION_NVP(s->counter_map);
-            ar& BOOST_SERIALIZATION_NVP(s->average_speed_map);
+            ar& BOOST_SERIALIZATION_NVP(s->keys);
+            ar& BOOST_SERIALIZATION_NVP(s->counters);
+            ar& BOOST_SERIALIZATION_NVP(s->average);
+            if (Archive::is_loading::value) {
+                s->index.clear();
+                s->index.reserve(s->keys.size());
+                for (uint32_t i = 0; i < s->keys.size(); i++) s->index.emplace(s->keys[i], i);
+            }
         }
     }
 
@@ -99,8 +147,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                              uint64_t sampled_number_of_bytes) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        Counter& counters = s.counter_map[key];
-        increment_outgoing_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+        increment_outgoing_counters(s.counter_ref(key), current_packet, sampled_number_of_packets, sampled_number_of_bytes);
     }
 
     template <size_t N>
@@ -110,7 +157,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                              uint64_t sampled_number_of_bytes) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        Counter& counters = s.counter_map[key];
+        Counter& counters = s.counter_ref(key);
 
         extern time_t current_inaccurate_time;
         counters.last_update_time = current_inaccurate_time;
@@ -129,8 +176,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                              uint64_t sampled_number_of_bytes) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        Counter& counters = s.counter_map[key];
-        increment_incoming_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+        increment_incoming_counters(s.counter_ref(key), current_packet, sampled_number_of_packets, sampled_number_of_bytes);
     }
 
     template <size_t N>
@@ -140,7 +186,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                              uint64_t sampled_number_of_bytes) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        Counter& counters = s.counter_map[key];
+        Counter& counters = s.counter_ref(key);
 
         extern time_t current_inaccurate_time;
         counters.last_update_time = current_inaccurate_time;
@@ -153,42 +199,51 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         }
     }
 
-    // ---- accessors (replace former direct .counter_map / .average_speed_map access) ----
+    // ---- accessors ----
 
     // Lock the key's shard and let the caller create/mutate its counter in place.
     template <typename F>
     void modify_counter_for_key(const T& key, F&& fn) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        fn(s.counter_map[key]);
+        fn(s.counter_ref(key));
     }
 
-    // Pre-create zeroed entries for a key in both maps (startup pre-allocation).
+    // Pre-create zeroed entries for a key (startup pre-allocation).
     void preallocate_key(const T& key, const Counter& zero_value) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        s.counter_map[key]       = zero_value;
-        s.average_speed_map[key] = zero_value;
+        auto it = s.index.find(key);
+        if (it != s.index.end()) {
+            s.counters[it->second] = zero_value;
+            s.average[it->second]  = zero_value;
+            return;
+        }
+        uint32_t slot = (uint32_t)s.keys.size();
+        s.index.emplace(key, slot);
+        s.keys.push_back(key);
+        s.counters.push_back(zero_value);
+        s.average.push_back(zero_value);
     }
 
     size_t size() {
         size_t total = 0;
-        for (auto& s : shards) { std::lock_guard<std::mutex> g(s->mutex); total += s->counter_map.size(); }
+        for (auto& s : shards) { std::lock_guard<std::mutex> g(s->mutex); total += s->keys.size(); }
         return total;
     }
 
     size_t average_speed_size() {
         size_t total = 0;
-        for (auto& s : shards) { std::lock_guard<std::mutex> g(s->mutex); total += s->average_speed_map.size(); }
+        for (auto& s : shards) { std::lock_guard<std::mutex> g(s->mutex); total += s->average.size(); }
         return total;
     }
 
-    // ---- snapshot / query: merge across shards -----------------------------
-    void get_all_average_speed_elements(UM& copy_of_average_speed_map) {
+    // ---- snapshot / query ----
+    void get_all_average_speed_elements(std::unordered_map<T, Counter>& copy_of_average_speed_map) {
         copy_of_average_speed_map.clear();
         for (auto& s : shards) {
             std::lock_guard<std::mutex> lock_guard(s->mutex);
-            copy_of_average_speed_map.insert(s->average_speed_map.begin(), s->average_speed_map.end());
+            for (size_t j = 0; j < s->keys.size(); j++) copy_of_average_speed_map[s->keys[j]] = s->average[j];
         }
     }
 
@@ -198,24 +253,36 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         time(&current_time);
         for (auto& s : shards) {
             std::lock_guard<std::mutex> lock_guard(s->mutex);
-            std::vector<T> keys_to_remove;
-            for (auto itr = s->counter_map.begin(); itr != s->counter_map.end(); ++itr) {
-                if ((int64_t)itr->second.last_update_time < int64_t((int64_t)current_time - (int64_t)automatic_data_cleanup_threshold)) {
-                    keys_to_remove.push_back(itr->first);
+            size_t j = 0;
+            while (j < s->keys.size()) {
+                if ((int64_t)s->counters[j].last_update_time <
+                    int64_t((int64_t)current_time - (int64_t)automatic_data_cleanup_threshold)) {
+                    // swap-with-last + pop; fix the moved key's index entry
+                    size_t last = s->keys.size() - 1;
+                    s->index.erase(s->keys[j]);
+                    if (j != last) {
+                        s->keys[j]     = s->keys[last];
+                        s->counters[j] = s->counters[last];
+                        s->average[j]  = s->average[last];
+                        s->index[s->keys[j]] = (uint32_t)j;
+                    }
+                    s->keys.pop_back();
+                    s->counters.pop_back();
+                    s->average.pop_back();
+                    removed++;
+                    // do not advance j: the swapped-in element must be checked
+                } else {
+                    j++;
                 }
             }
-            for (const auto& key : keys_to_remove) {
-                s->counter_map.erase(key);
-                s->average_speed_map.erase(key);
-            }
-            removed += keys_to_remove.size();
         }
         return removed;
     }
 
     // ---- the 1s sweep: each shard swept under its own lock -----------------
-    // Shards are swept sequentially when recalc_threads<=1 (behaviour-identical). With
-    // more threads, shards are fanned across workers; the per-shard body is independent.
+    // Shards are swept sequentially when recalc_threads<=1 (behaviour-identical). With more threads
+    // they are fanned across workers. The per-shard body is a CONTIGUOUS linear scan of the dense
+    // vectors — sequential, prefetchable, no per-host hash lookup.
     void recalculate_speed(double speed_calc_period,
                            double average_calculation_time,
                            std::function<void(const T&, const Counter&)> speed_check_callback      = nullptr,
@@ -223,14 +290,12 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         double exp_power_subnet = -speed_calc_period / average_calculation_time;
         double exp_value_subnet = exp(exp_power_subnet);
 
-        // Per-shard work. Shards are independent (separate maps + lock), so this body
-        // is safe to run on many shards concurrently; only the callbacks, if they touch
-        // shared state, need to be thread-safe.
         auto process_shard = [&](shard_t& s) {
             std::lock_guard<std::mutex> lock_guard(s.mutex);
-            for (auto itr = s.counter_map.begin(); itr != s.counter_map.end(); ++itr) {
-                const T& current_key      = itr->first;
-                Counter& traffic_counters = itr->second;
+            const size_t n = s.keys.size();
+            for (size_t j = 0; j < n; j++) {
+                const T& current_key      = s.keys[j];
+                Counter& traffic_counters = s.counters[j];
 
                 Counter new_speed_element;
                 build_speed_counters_from_packet_counters(new_speed_element, traffic_counters, speed_calc_period);
@@ -239,7 +304,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                     new_speed_calc_callback(current_key, new_speed_element, speed_calc_period);
                 }
 
-                Counter& current_average_speed_element = s.average_speed_map[current_key];
+                Counter& current_average_speed_element = s.average[j];
                 build_average_speed_counters_from_speed_counters(current_average_speed_element, new_speed_element, exp_value_subnet);
 
                 traffic_counters.zeroify();
@@ -251,21 +316,13 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         };
 
         if (recalc_threads <= 1 || num_shards <= 1) {
-            // Sequential sweep — identical to the original behaviour.
             for (auto& sp : shards) process_shard(*sp);
         } else {
-            // Parallel sweep: workers pull shards off a shared counter until exhausted.
-            // A throwing callback must not call std::terminate in a worker thread, so we
-            // capture the first exception and rethrow after joining — matching the
-            // sequential path, where an exception propagates out of recalculate_speed.
             size_t nt = std::min(recalc_threads, num_shards);
             std::atomic<size_t> next_shard{ 0 };
             std::exception_ptr first_error;
             std::mutex error_mutex;
 
-            // Each worker (and the current thread, in the fallback below) runs this: pull
-            // shards off next_shard until none remain. Any worker count >= 1 drains every
-            // shard, so losing some workers only costs parallelism, never coverage.
             auto worker_body = [&]() {
                 size_t i;
                 while ((i = next_shard.fetch_add(1)) < num_shards) {
@@ -280,27 +337,12 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
 
             std::vector<std::thread> workers;
             workers.reserve(nt);
-
-            // Creating a thread can fail under resource exhaustion (pthread_create EAGAIN
-            // on RLIMIT_NPROC / stack memory), which throws std::system_error from the
-            // std::thread constructor. If that propagated here, the workers vector would be
-            // destroyed with still-joinable threads and call std::terminate() — turning a
-            // transient shortage into a daemon crash. Instead we stop spawning and keep the
-            // workers we already have; if none were created we sweep inline. Correctness is
-            // preserved either way (every shard is still processed exactly once).
             try {
-                for (size_t t = 0; t < nt; t++) {
-                    workers.emplace_back(worker_body);
-                }
+                for (size_t t = 0; t < nt; t++) workers.emplace_back(worker_body);
             } catch (const std::system_error&) {
                 // Degrade gracefully to however many workers we managed to start.
             }
-
-            if (workers.empty()) {
-                // Not a single worker could be started: do the whole sweep on this thread.
-                worker_body();
-            }
-
+            if (workers.empty()) worker_body();
             for (auto& w : workers) w.join();
             if (first_error) std::rethrow_exception(first_error);
         }
@@ -309,9 +351,9 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
     void get_all_non_zero_average_speed_elements_as_pairs(std::vector<std::pair<T, Counter>>& all_elements) {
         for (auto& s : shards) {
             std::lock_guard<std::mutex> lock_guard(s->mutex);
-            for (auto itr = s->average_speed_map.begin(); itr != s->average_speed_map.end(); ++itr) {
-                if (itr->second.is_zero()) continue;
-                all_elements.push_back(std::make_pair(itr->first, itr->second));
+            for (size_t j = 0; j < s->keys.size(); j++) {
+                if (s->average[j].is_zero()) continue;
+                all_elements.push_back(std::make_pair(s->keys[j], s->average[j]));
             }
         }
     }
@@ -321,7 +363,8 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                   const attack_detection_direction_type_t& sort_direction) {
         for (auto& s : shards) {
             std::lock_guard<std::mutex> lock_guard(s->mutex);
-            std::copy(s->average_speed_map.begin(), s->average_speed_map.end(), std::back_inserter(vector_for_sort));
+            for (size_t j = 0; j < s->keys.size(); j++)
+                vector_for_sort.push_back(std::make_pair(s->keys[j], s->average[j]));
         }
         std::sort(vector_for_sort.begin(), vector_for_sort.end(),
                   TrafficComparatorClass<std::pair<T, Counter>>(sort_direction, sorter_type));
@@ -330,21 +373,41 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
     bool get_average_speed(const T& key, Counter& average_speed_element) {
         shard_t& s = shard_for(key);
         std::lock_guard<std::mutex> lock_guard(s.mutex);
-        auto average_speed_itr = s.average_speed_map.find(key);
-        if (average_speed_itr == s.average_speed_map.end()) return false;
-        average_speed_element = average_speed_itr->second;
+        auto it = s.index.find(key);
+        if (it == s.index.end()) return false;
+        average_speed_element = s.average[it->second];
         return true;
     }
 
     void get_top_k_average_speed(std::vector<std::pair<T, Counter>>& vector_for_sort,
                                  const attack_detection_threshold_type_t& sorter_type,
                                  const attack_detection_direction_type_t& sort_direction) {
+        const TrafficComparatorClass<std::pair<T, Counter>> comparator(sort_direction, sorter_type);
+        const size_t k = vector_for_sort.size();
+
+        // Per-shard top-k buffer, reused across shards. Bounded by k (rows the caller wants), never
+        // by host count, so this reporting path does no O(hosts) allocation.
+        std::vector<std::pair<T, Counter>> shard_pairs;
+        std::vector<std::pair<T, Counter>> shard_top(k);
         std::vector<std::pair<T, Counter>> merged;
+        merged.reserve(shards.size() * k);
+
         for (auto& s : shards) {
-            std::lock_guard<std::mutex> lock_guard(s->mutex);
-            std::copy(s->average_speed_map.begin(), s->average_speed_map.end(), std::back_inserter(merged));
+            typename std::vector<std::pair<T, Counter>>::iterator shard_top_end;
+            {
+                std::lock_guard<std::mutex> lock_guard(s->mutex);
+                shard_pairs.clear();
+                shard_pairs.reserve(s->keys.size());
+                for (size_t j = 0; j < s->keys.size(); j++)
+                    shard_pairs.push_back(std::make_pair(s->keys[j], s->average[j]));
+                shard_top_end = std::partial_sort_copy(shard_pairs.begin(), shard_pairs.end(),
+                                                       shard_top.begin(), shard_top.end(), comparator);
+            }
+            merged.insert(merged.end(), shard_top.begin(), shard_top_end);
         }
+
+        // Global top-k over the union equals the top-k over the concatenation of per-shard top-k.
         std::partial_sort_copy(merged.begin(), merged.end(), vector_for_sort.begin(), vector_for_sort.end(),
-                               TrafficComparatorClass<std::pair<T, Counter>>(sort_direction, sorter_type));
+                               comparator);
     }
 };

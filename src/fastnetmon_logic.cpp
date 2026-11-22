@@ -136,7 +136,6 @@ extern bool exabgp_announce_whole_subnet;
 extern subnet_to_host_group_map_t subnet_to_host_groups;
 extern bool collect_attack_pcap_dumps;
 
-extern std::mutex flow_counter_mutex;
 
 #ifdef REDIS
 extern unsigned int redis_port;
@@ -1875,14 +1874,15 @@ void speed_calculation_callback_local_ipv4(const uint32_t& client_ip, const subn
 // Increments in and out flow counters
 // Returns false when we cannot find flow for this IP
 bool increment_flow_counters(subnet_counter_t& new_speed_element, uint32_t client_ip, double speed_calc_period) {
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
-    extern std::mutex flow_counter_mutex;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
-    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+    size_t flow_shard = sharded_flow_counters_t::shard_of(client_ip);
+    std::lock_guard<std::mutex> lock_guard(SubnetVectorMapFlow.mutexes[flow_shard]);
+    auto& flow_map = SubnetVectorMapFlow.maps[flow_shard];
 
-    auto current_flow_counter = SubnetVectorMapFlow.find(client_ip);
+    auto current_flow_counter = flow_map.find(client_ip);
 
-    if (current_flow_counter == SubnetVectorMapFlow.end()) {
+    if (current_flow_counter == flow_map.end()) {
         // We have no entries for this IP
         return false;
     }
@@ -1910,7 +1910,7 @@ void recalculate_speed() {
     double speed_calc_period = recalculate_speed_timeout;
 
     extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
     std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
 
@@ -1962,6 +1962,7 @@ void recalculate_speed() {
     std::atomic<uint64_t> flow_exists_for_ip{ 0 };
     std::atomic<uint64_t> flow_does_not_exist_for_ip{ 0 };
 
+    std::chrono::steady_clock::time_point fnm_sweep_t0 = std::chrono::steady_clock::now();
     ipv4_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv4, [&outgoing_total_flows, &incoming_total_flows, &flow_exists_for_ip,
      &flow_does_not_exist_for_ip](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
         if (enable_connection_tracking) {
@@ -1983,6 +1984,12 @@ void recalculate_speed() {
             }
         }
     });
+
+    static const bool fnm_bench_sweep = (getenv("FNM_BENCH_LOG") != nullptr);
+    if (fnm_bench_sweep) {
+        double sweep_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fnm_sweep_t0).count();
+        logger << log4cpp::Priority::INFO << "FNM_BENCH host_sweep_only_ms=" << sweep_ms;
+    }
 
     // Calculate IPv6 per network traffic
     ipv6_network_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
@@ -2030,6 +2037,13 @@ void recalculate_speed() {
 #else
     speed_calculation_time.tv_usec = suseconds_t(fractional * 1000000);
 #endif
+
+    // Benchmark-only: log the exact integrated recalc duration every iteration (env-gated, 1 Hz).
+    static const bool fnm_bench_log = (getenv("FNM_BENCH_LOG") != nullptr);
+    if (fnm_bench_log) {
+        logger << log4cpp::Priority::INFO << "FNM_BENCH recalc_ms=" << (speed_calculation_diff.count() * 1000.0)
+               << " hosts=" << ipv4_host_counters.size();
+    }
 
     // Report cases when we calculate speed too slow
     if (speed_calculation_time.tv_sec > 0) {
@@ -2182,12 +2196,12 @@ void print_screen_contents_into_file(std::string screen_data_stats_param, std::s
 }
 
 void zeroify_all_flow_counters() {
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
-    extern std::mutex flow_counter_mutex;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
-    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
-
-    SubnetVectorMapFlow.clear();
+    for (size_t i = 0; i < FLOW_COUNTER_SHARD_COUNT; i++) {
+        std::lock_guard<std::mutex> lock_guard(SubnetVectorMapFlow.mutexes[i]);
+        SubnetVectorMapFlow.maps[i].clear();
+    }
 }
 
 
@@ -2365,7 +2379,7 @@ void process_packet(simple_packet_t& current_packet) {
     extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
     extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
     extern std::vector<flow_spec_rule_t> static_flowspec_based_whitelist;
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
     extern uint64_t total_flowspec_whitelist_packets;
 
 #ifdef KAFKA
@@ -2552,8 +2566,7 @@ void increment_incoming_flow_counters(uint32_t client_ip,
                                       const simple_packet_t& current_packet,
                                       uint64_t sampled_number_of_packets,
                                       uint64_t sampled_number_of_bytes) {
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
-    extern std::mutex flow_counter_mutex;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
     packed_conntrack_hash_t flow_tracking_structure;
     init_incoming_flow_counting_structure(flow_tracking_structure, current_packet);
@@ -2566,8 +2579,9 @@ void increment_incoming_flow_counters(uint32_t client_ip,
     //    << " packets " << sampled_number_of_packets << " bytes " << sampled_number_of_bytes << " hash " << connection_tracking_hash;
 
     {
-        std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
-        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow[client_ip];
+        size_t flow_shard = sharded_flow_counters_t::shard_of(client_ip);
+        std::lock_guard<std::mutex> lock_guard(SubnetVectorMapFlow.mutexes[flow_shard]);
+        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow.maps[flow_shard][client_ip];
 
         if (current_packet.protocol == IPPROTO_TCP) {
             conntrack_key_struct_t& conntrack_key_struct = current_element_flow.in_tcp[connection_tracking_hash];
@@ -2598,8 +2612,7 @@ void increment_outgoing_flow_counters(uint32_t client_ip,
                                       const simple_packet_t& current_packet,
                                       uint64_t sampled_number_of_packets,
                                       uint64_t sampled_number_of_bytes) {
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
-    extern std::mutex flow_counter_mutex;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
     packed_conntrack_hash_t flow_tracking_structure;
     init_outgoing_flow_counting_structure(flow_tracking_structure, current_packet);
@@ -2612,9 +2625,10 @@ void increment_outgoing_flow_counters(uint32_t client_ip,
     //    << " packets " << sampled_number_of_packets << " bytes " << sampled_number_of_bytes << " hash " << connection_tracking_hash;
 
     {
-        std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+        size_t flow_shard = sharded_flow_counters_t::shard_of(client_ip);
+        std::lock_guard<std::mutex> lock_guard(SubnetVectorMapFlow.mutexes[flow_shard]);
 
-        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow[client_ip];
+        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow.maps[flow_shard][client_ip];
 
         if (current_packet.protocol == IPPROTO_TCP) {
             conntrack_key_struct_t& conntrack_key_struct = current_element_flow.out_tcp[connection_tracking_hash];
@@ -2743,20 +2757,19 @@ void execute_ipv4_ban(uint32_t client_ip,
 
 
 // With this function we could get any element from our flow counter structure
-bool get_element_from_map_of_flow_counters(map_of_vector_counters_for_flow_t& map_of_counters,
+bool get_element_from_map_of_flow_counters(sharded_flow_counters_t& flow_counters,
                                            uint32_t client_ip,
                                            conntrack_main_struct_t& current_conntrack_structure) {
-    extern std::mutex flow_counter_mutex;
-
-    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
-    current_conntrack_structure = map_of_counters[client_ip];
+    size_t flow_shard = sharded_flow_counters_t::shard_of(client_ip);
+    std::lock_guard<std::mutex> lock_guard(flow_counters.mutexes[flow_shard]);
+    current_conntrack_structure = flow_counters.maps[flow_shard][client_ip];
 
     return true;
 }
 
 void process_filled_buckets_ipv4() {
     extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
-    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern sharded_flow_counters_t SubnetVectorMapFlow;
 
     std::vector<uint32_t> filled_buckets;
 
