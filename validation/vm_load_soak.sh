@@ -19,6 +19,7 @@ FNM_BIN="${FNM_BIN:-$FNM_SRC/src/build_own/fastnetmon}"
 TESTS_DIR="${TESTS_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 STAGE="${1:-all}"
 WORKERS="${WORKERS:-4}"
+CT="${CT:-on}"            # connection tracking on/off for the load stages
 RATE="${RATE:-150000}"
 SOAK_SECONDS="${SOAK_SECONDS:-3600}"
 RSS_GUARD_MB="${RSS_GUARD_MB:-26000}"
@@ -81,7 +82,7 @@ sample_window(){ # $1=seconds
 
 ingest_stage(){
   log "===== Stage 7: REAL INGESTION concurrent with recalc ====="
-  start_daemon on || return 1
+  start_daemon "$CT" || return 1
   local before=$(udp_errs)
   log "starting generator: 500k distinct hosts in 10.0.0.0/9, rate=$RATE flows/s, 120s, 20 attackers"
   python3 "$GEN" --host 127.0.0.1 --port 2055 --subnet 10.0.0.0/9 --hosts 500000 --rate "$RATE" \
@@ -98,7 +99,7 @@ ingest_stage(){
 
 stress_stage(){
   log "===== Stage 8: STRESS (ramping offered rate) ====="
-  start_daemon on || return 1
+  start_daemon "$CT" || return 1
   for r in 150000 300000 500000 800000; do
     python3 "$GEN" --host 127.0.0.1 --port 2055 --subnet 10.0.0.0/9 --hosts 500000 --rate "$r" \
        --duration 60 --direction both --attackers 20 --attacker-pps 400000 --seed 1 >"$OUT/gen_stress_$r.txt" 2>&1 &
@@ -111,7 +112,7 @@ stress_stage(){
 
 soak_stage(){
   log "===== Stage 9: SOAK (${SOAK_SECONDS}s at 10M + continuous traffic) ====="
-  start_daemon on || return 1
+  start_daemon "$CT" || return 1
   python3 "$GEN" --host 127.0.0.1 --port 2055 --subnet 10.0.0.0/9 --hosts 500000 --rate "$RATE" \
      --duration 0 --direction both --attackers 20 --attacker-pps 400000 --seed 1 >"$OUT/gen_soak.txt" 2>&1 &
   GENPID=$!; sleep 10
