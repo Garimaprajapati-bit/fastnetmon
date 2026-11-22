@@ -27,6 +27,9 @@ TUNE_RMEM="${TUNE_RMEM:-1}"
 NETWORKS="${NETWORKS:-10.0.0.0/9 10.128.0.0/11}"   # 10,485,760 hosts
 GEN="${GEN:-$FNM_SRC/integration-kit/netflow_gen.py}"; [ -f "$GEN" ] || GEN="$TESTS_DIR/netflow_gen.py"
 CONF=/tmp/fnm_load.conf; DLOG=/var/log/fastnetmon.log
+# Single-instance lock: a second concurrent run would pkill the first run's daemon at startup.
+exec 9>/tmp/fnm_load_soak.lock
+if ! flock -n 9; then echo "ERROR: another vm_load_soak.sh run is already active (lock /tmp/fnm_load_soak.lock). Refusing to start a second one."; exit 1; fi
 TS=$(date +%Y%m%d_%H%M%S); OUT="${OUT:-$PWD/vm_loadsoak_$TS}"; mkdir -p "$OUT"
 SUM="$OUT/SUMMARY.txt"
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$SUM"; }
