@@ -32,6 +32,8 @@
 #include <exception>
 #include <unordered_map>
 #include <cstdint>
+#include <cstddef>
+#include <ranges>
 
 #include "speed_counters.hpp"
 
@@ -51,11 +53,34 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
     // One independent partition. Dense parallel vectors + a key->slot index. unique_ptr because
     // std::mutex is non-movable.
     struct shard_t {
-        std::unordered_map<T, uint32_t> index; // key -> dense slot
-        std::vector<T> keys;                    // slot -> key
-        std::vector<Counter> counters;          // slot -> current packet counters
-        std::vector<Counter> average;           // slot -> average speed
+        // slot_index_t is size_t so the index never truncates keys.size(); used consistently by the
+        // index map, inserts, purge and (implicitly) iteration.
+        using slot_index_t = size_t;
+        std::unordered_map<T, slot_index_t> index; // key -> dense slot
+        std::vector<T> keys;                        // slot -> key
+        std::vector<Counter> counters;              // slot -> current packet counters
+        std::vector<Counter> average;               // slot -> average speed
         std::mutex mutex;
+
+        // Append a brand-new key with the given initial values TRANSACTIONALLY: either all four
+        // containers gain the new slot, or none do (strong exception guarantee). std::vector::push_back
+        // is individually strong-guaranteed, and pop_back / this rollback are noexcept, so a mid-way
+        // bad_alloc can never leave the index pointing at a non-existent slot or the vectors at unequal
+        // sizes. Returns the new slot. Caller must hold the shard lock and know the key is absent.
+        inline slot_index_t append_slot(const T& key, const Counter& init_counter, const Counter& init_average) {
+            slot_index_t slot = keys.size();
+            keys.push_back(key);
+            try {
+                counters.push_back(init_counter);
+                try {
+                    average.push_back(init_average);
+                    try {
+                        index.emplace(key, slot);
+                    } catch (...) { average.pop_back(); counters.pop_back(); keys.pop_back(); throw; }
+                } catch (...) { counters.pop_back(); keys.pop_back(); throw; }
+            } catch (...) { keys.pop_back(); throw; }
+            return slot;
+        }
 
         // Get (creating if absent) the current-counter slot for a key. Returns a reference valid
         // only until the next insert on this shard (vector may reallocate) — callers use it under
@@ -63,11 +88,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         inline Counter& counter_ref(const T& key) {
             auto it = index.find(key);
             if (it != index.end()) return counters[it->second];
-            uint32_t slot = (uint32_t)keys.size();
-            index.emplace(key, slot);
-            keys.push_back(key);
-            counters.emplace_back();
-            average.emplace_back();
+            slot_index_t slot = append_slot(key, Counter{}, Counter{});
             return counters[slot];
         }
     };
@@ -219,11 +240,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
             s.average[it->second]  = zero_value;
             return;
         }
-        uint32_t slot = (uint32_t)s.keys.size();
-        s.index.emplace(key, slot);
-        s.keys.push_back(key);
-        s.counters.push_back(zero_value);
-        s.average.push_back(zero_value);
+        s.append_slot(key, zero_value, zero_value);   // transactional, all-or-nothing
     }
 
     size_t size() {
@@ -264,7 +281,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                         s->keys[j]     = s->keys[last];
                         s->counters[j] = s->counters[last];
                         s->average[j]  = s->average[last];
-                        s->index[s->keys[j]] = (uint32_t)j;
+                        s->index[s->keys[j]] = j;   // size_t slot, no truncation
                     }
                     s->keys.pop_back();
                     s->counters.pop_back();
@@ -384,10 +401,11 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
                                  const attack_detection_direction_type_t& sort_direction) {
         const TrafficComparatorClass<std::pair<T, Counter>> comparator(sort_direction, sorter_type);
         const size_t k = vector_for_sort.size();
+        if (k == 0) return;
 
-        // Per-shard top-k buffer, reused across shards. Bounded by k (rows the caller wants), never
-        // by host count, so this reporting path does no O(hosts) allocation.
-        std::vector<std::pair<T, Counter>> shard_pairs;
+        // All buffers are bounded by k (the rows the caller wants) or shards*k — NEVER by host count.
+        // Per shard we select the top-k directly over a LAZY index->pair view, so partial_sort_copy
+        // keeps only a k-sized buffer internally and we never materialise an O(hosts) pairs vector.
         std::vector<std::pair<T, Counter>> shard_top(k);
         std::vector<std::pair<T, Counter>> merged;
         merged.reserve(shards.size() * k);
@@ -396,12 +414,15 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
             typename std::vector<std::pair<T, Counter>>::iterator shard_top_end;
             {
                 std::lock_guard<std::mutex> lock_guard(s->mutex);
-                shard_pairs.clear();
-                shard_pairs.reserve(s->keys.size());
-                for (size_t j = 0; j < s->keys.size(); j++)
-                    shard_pairs.push_back(std::make_pair(s->keys[j], s->average[j]));
-                shard_top_end = std::partial_sort_copy(shard_pairs.begin(), shard_pairs.end(),
-                                                       shard_top.begin(), shard_top.end(), comparator);
+                auto pair_view = std::views::iota(std::size_t{ 0 }, s->keys.size()) |
+                                 std::views::transform([&s](std::size_t j) {
+                                     return std::make_pair(s->keys[j], s->average[j]);
+                                 });
+                // std::ranges::partial_sort_copy keeps only a k-sized buffer internally and supports
+                // lazy view iterators (the classic std::partial_sort_copy does not), so no O(hosts)
+                // vector is ever materialised. Returns {in, out}; out is the end of what was written.
+                auto res = std::ranges::partial_sort_copy(pair_view, shard_top, comparator);
+                shard_top_end = res.out;
             }
             merged.insert(merged.end(), shard_top.begin(), shard_top_end);
         }
