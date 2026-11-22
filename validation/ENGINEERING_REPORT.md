@@ -263,6 +263,8 @@ not the parallelization. The UDP drops at ≥ 500 k/s are the **single-threaded 
 - **Detection parity** (real daemon, real attacker traffic, threads 1 vs 4): **30 == 30, PASS**;
   **20/20** attackers detected under live ingestion.
 - **Multi-shard perf unit test:** redistribution lossless (0 misplaced).
+- **Daemon-level ThreadSanitizer** (conntrack sharding + sweep under live traffic): **0
+  feature-introduced races** (feature ON vs OFF race sites identical; residual warnings pre-existing).
 
 ---
 
@@ -292,9 +294,13 @@ not the parallelization. The UDP drops at ≥ 500 k/s are the **single-threaded 
    and was deliberately not attempted (minimal-change principle).
 3. **The NetFlow collector is single-threaded** and drops traffic above ~300 k flows/s regardless of
    the sweep. This is a separate receive-path limit, out of scope for speed calculation.
-4. **Soak passed** (1 h at 10 M + traffic: no leak, no drift — §7.5). The one remaining robustness gate
-   is a **daemon-level ThreadSanitizer run** (conntrack sharding under live packet writers); the
-   counter-core TSan is already clean.
+4. **Soak passed** (1 h at 10 M + traffic: no leak, no drift — §7.5). **Daemon-level ThreadSanitizer
+   passed too:** under live traffic with conntrack on, the parallel sweep ON (threads=4) vs OFF
+   (threads=1) show the **same** race sites (36 vs 37 warnings, 13 functions each) and **zero functions
+   race only with the feature on** — the sharded sweep and sharded conntrack introduce **no new data
+   races**. The residual warnings are pre-existing (lock-free global aggregate counters + gRPC event
+   engine), present with the feature off too and out of scope. With the deterministic counter-core TSan
+   already clean, concurrency is signed off.
 
 **Code-review follow-ups (done).** An external review of the dense storage raised three items, all
 fixed (commit `5d9bd47`): (1) `get_top_k` no longer allocates proportional to host count — it selects
