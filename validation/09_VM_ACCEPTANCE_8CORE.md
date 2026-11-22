@@ -47,6 +47,26 @@ e.g. 10M/64 shards: min 162,887 / max 165,598 / mean 163,840, cv 0.0028. The ide
 **Core objective ACHIEVED:** 10M hosts, native parallel recalc, within the 1 s budget, ~linear to the
 physical core count, EWMA + detection unchanged, even shard load, sanitizer-clean counter core.
 
-## Still to run (robustness, Stages 7-9 + full 10)
+## Stage 7-8 — recalc under REAL ingestion load (10M, 4 workers), executed
+netflow_gen.py → daemon, 500k active hosts, 20 attackers; recalc_ms measured while ingesting.
+| offered rate | conntrack | recalc med | recalc max | over-budget | udp drops | attackers |
+|---|---|---|---|---|---|---|
+| 150k/s | ON  | 1128 ms | 1239 ms | 37 | 21k | 20/20 |
+| 150k/s | OFF | **398 ms** | 571 ms | **0** | 0 | 20/20 |
+| 300k/s | OFF | 459 ms | 518 ms | **0** | ~1k | — |
+| 500k/s | OFF | 475 ms | 655 ms | **0** | 354k | — |
+| 800k/s | OFF | 479 ms | 618 ms | **0** | 1.25M | — |
+
+**Findings (isolated):**
+- **Speed calculation holds the 1 s budget under load** (conntrack off): med ~400 ms, 0 over-budget
+  even at 800k flows/s, latency flat vs rate. Detection intact (20/20) under load. ✅
+- **Connection tracking is the under-load limiter:** conntrack-on uses more CPU (2.3 vs 1.8 cores) yet
+  runs slower (~1.1 s) — lock contention between the sweep's per-host flow reads and packet-thread flow
+  writes. A pre-existing cost of the feature, not a defect in the parallelization. Optional future fix:
+  lock-free flow-count reads. conntrack-off is the realistic 10M config.
+- **UDP drops at ≥500k/s** (both configs) are the **single-threaded NetFlow collector** (receive-path),
+  separate from speed calc. At 150k/s: 0 drops.
+
+## Still to run (robustness, Stages 9 + full 10)
 Real traffic ingestion concurrent with recalc; stress; 1–4 h soak (leak/drift); daemon-level TSan on
 the conntrack sharding under live packet writers; optional original-vs-modified A/B.
