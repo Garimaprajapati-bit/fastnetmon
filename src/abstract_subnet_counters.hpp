@@ -63,22 +63,26 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
         std::mutex mutex;
 
         // Append a brand-new key with the given initial values TRANSACTIONALLY: either all four
-        // containers gain the new slot, or none do (strong exception guarantee). std::vector::push_back
-        // is individually strong-guaranteed, and pop_back / this rollback are noexcept, so a mid-way
-        // bad_alloc can never leave the index pointing at a non-existent slot or the vectors at unequal
-        // sizes. Returns the new slot. Caller must hold the shard lock and know the key is absent.
+        // containers gain the new slot, or none do (strong exception guarantee). A single catch rolls
+        // back EXACTLY the operations that completed (tracked by `done`), so every pop_back runs at most
+        // once and never on an empty vector. std::vector::push_back is individually strong-guaranteed
+        // (on throw the vector is unchanged, so the throwing op is never rolled back), and pop_back is
+        // noexcept — so a mid-way bad_alloc can never leave the index pointing at a non-existent slot or
+        // the vectors at unequal sizes. Returns the new slot. Caller holds the shard lock, key absent.
         inline slot_index_t append_slot(const T& key, const Counter& init_counter, const Counter& init_average) {
             slot_index_t slot = keys.size();
-            keys.push_back(key);
+            int done = 0; // number of the 4 steps below that have fully succeeded
             try {
-                counters.push_back(init_counter);
-                try {
-                    average.push_back(init_average);
-                    try {
-                        index.emplace(key, slot);
-                    } catch (...) { average.pop_back(); counters.pop_back(); keys.pop_back(); throw; }
-                } catch (...) { counters.pop_back(); keys.pop_back(); throw; }
-            } catch (...) { keys.pop_back(); throw; }
+                keys.push_back(key);              ++done; // 1
+                counters.push_back(init_counter); ++done; // 2
+                average.push_back(init_average);  ++done; // 3
+                index.emplace(key, slot);         ++done; // 4
+            } catch (...) {
+                if (done >= 3) average.pop_back();
+                if (done >= 2) counters.pop_back();
+                if (done >= 1) keys.pop_back();
+                throw;
+            }
             return slot;
         }
 
