@@ -137,24 +137,26 @@ init_stage(){
   log "Init done. Verify: hosts == configured count, init time, rss_hwm, shard dist (min/max/cv/empty)."
 }
 
+SCALE_THREADS="${THREADS_LIST:-1 2 4 8}"   # set THREADS_LIST="1 2 4 8 16" on a 16-core box
+SCALE_HOSTS="${SCALE_HOSTS:-1M 5M 10M}"
 scale_stage(){
-  log "===== Stage 6: RECALC SCALABILITY 1/2/4/8 ====="
+  log "===== Stage 6: RECALC SCALABILITY ($SCALE_THREADS workers) ====="
   [ -s "$CSV" ] || echo "scale,ban,conntrack,threads,hosts,init_s,rss_hwm_mb,rss_now_mb,cpus_busy,samples,recalc_min,recalc_med,recalc_p95,recalc_max,warns" > "$CSV"
-  for scale in 1M 5M 10M; do
+  for scale in $SCALE_HOSTS; do
     for ct in off on; do
-      for th in 1 2 4 8; do
+      for th in $SCALE_THREADS; do
         run_one "$scale" on "$ct" "$th" 22
       done
-      log "-- speedup $scale conntrack=$ct (min-based): compute T(1)/T(N) from CSV --"
+      log "-- speedup $scale conntrack=$ct (min-based): computed from CSV below --"
     done
   done
-  # speedup/efficiency table from CSV (min column)
+  # speedup/efficiency table from CSV (min column), over whatever thread counts were run
   log "--- SPEEDUP & EFFICIENCY (min recalc_ms) ---"
-  awk -F, 'NR>1 && $2=="on"{key=$1"_"$3; t[key"_"$4]=$11}
-    END{ split("1M 5M 10M",S," "); split("off on",C," ");
-      for(si in S){for(ci in C){k=S[si]"_"C[ci]; b=t[k"_1"];
+  awk -F, -v TH="$SCALE_THREADS" -v HS="$SCALE_HOSTS" 'NR>1 && $2=="on"{key=$1"_"$3; t[key"_"$4]=$11}
+    END{ nS=split(HS,S," "); split("off on",C," "); nT=split(TH,TT," ");
+      for(si=1;si<=nS;si++){for(ci in C){k=S[si]"_"C[ci]; b=t[k"_1"];
         if(b!=""){ printf "scale=%s conntrack=%s  ", S[si], C[ci];
-          for(n=1;n<=8;n*=2){v=t[k"_"n]; if(v!=""){sp=b/v; printf "t%d=%s(%.2fx,%.0f%%) ", n, v, sp, sp/n*100}} print ""}}}}' "$CSV" | tee -a "$SUMMARY"
+          for(ti=1;ti<=nT;ti++){n=TT[ti]; v=t[k"_"n]; if(v!=""){sp=b/v; printf "t%s=%s(%.2fx,%.0f%%) ", n, v, sp, sp/n*100}} print ""}}}}' "$CSV" | tee -a "$SUMMARY"
 }
 
 correctness_stage(){
