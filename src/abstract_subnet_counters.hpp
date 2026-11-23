@@ -156,7 +156,7 @@ template <typename T, typename Counter, typename UM = std::unordered_map<T, Coun
             if (Archive::is_loading::value) {
                 s->index.clear();
                 s->index.reserve(s->keys.size());
-                for (uint32_t i = 0; i < s->keys.size(); i++) s->index.emplace(s->keys[i], i);
+                for (size_t i = 0; i < s->keys.size(); i++) s->index.emplace(s->keys[i], i);
             }
         }
     }
